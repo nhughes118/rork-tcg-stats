@@ -25,8 +25,11 @@ data class DeckCard(
     val set: String,
     val number: String,
     val category: CardCategory,
+    /** Variant key when this name covers several distinct cards (see [CardVariants]). */
+    val variant: String? = null,
 ) {
-    val key: String by lazy(LazyThreadSafetyMode.PUBLICATION) { CardText.key(name) }
+    val nameKey: String by lazy(LazyThreadSafetyMode.PUBLICATION) { CardText.key(name) }
+    val key: String get() = variant ?: nameKey
 }
 
 /** A printed card used to represent a card name (image, set, number). */
@@ -36,9 +39,18 @@ data class CardIdentity(
     val set: String,
     val number: String,
     val category: CardCategory,
+    /** Variant key when the name covers several distinct cards. */
+    val variant: String? = null,
+    /** Short distinguishing text for variants, e.g. "Darkness · Whirling Envy". */
+    val note: String? = null,
 ) {
-    val key: String get() = CardText.key(name)
-    val printLabel: String get() = if (set.isEmpty()) category.title else "$set $number"
+    val nameKey: String get() = CardText.key(name)
+    val key: String get() = variant ?: nameKey
+    val printLabel: String
+        get() {
+            val base = if (set.isEmpty()) category.title else "$set $number"
+            return if (note.isNullOrEmpty()) base else "$base · $note"
+        }
 
     fun imageUrl(large: Boolean = false): String? {
         if (set.isEmpty() || number.isEmpty()) return null

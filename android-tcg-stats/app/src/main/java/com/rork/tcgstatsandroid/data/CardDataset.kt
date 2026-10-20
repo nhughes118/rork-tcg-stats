@@ -22,19 +22,32 @@ object Weeks {
 private class DeckAccumulator(val icons: List<String>, var count: Int = 0, var best: Int? = null)
 
 /** Aggregated tournament data with card indexes and stats computation. */
-class CardDataset(input: List<TournamentRecord>, val generatedAt: Long = System.currentTimeMillis()) {
-    val tournaments: List<TournamentRecord> = input.sortedByDescending { it.date }
+class CardDataset(
+    input: List<TournamentRecord>,
+    val generatedAt: Long = System.currentTimeMillis(),
+    variants: Map<String, CardVariant> = emptyMap(),
+) {
+    val tournaments: List<TournamentRecord> = applyVariants(input, variants).sortedByDescending { it.date }
     val cards: Map<String, CardIdentity>
     val printIndex: Map<String, String>
     val setCodes: Set<String>
     val recentUsage: Map<String, Double>
+    /** Card keys per plain name, when a name covers several distinct cards. */
+    val keysByName: Map<String, List<String>>
+    /** Attack/ability names for variant keys, used to disambiguate scans. */
+    val variantMoves: Map<String, List<String>> = variants.values.associate { it.key to it.moves }
+    private val noteByKey: Map<String, String> = variants.values.associate { it.key to it.note }
 
     init {
         val printCounts = HashMap<String, HashMap<CardIdentity, Int>>()
         val prints = HashMap<String, String>()
         val sets = HashSet<String>()
         for (t in tournaments) for (e in t.entries) for (c in e.cards) {
-            val identity = CardIdentity(c.name, c.set, c.number, c.category)
+            val identity = CardIdentity(
+                c.name, c.set, c.number, c.category,
+                variant = c.variant,
+                note = c.variant?.let { noteByKey[it] },
+            )
             val counts = printCounts.getOrPut(c.key) { HashMap() }
             counts[identity] = (counts[identity] ?: 0) + 1
             if (c.set.isNotEmpty()) {
@@ -57,6 +70,33 @@ class CardDataset(input: List<TournamentRecord>, val generatedAt: Long = System.
             }
         }
         recentUsage = if (total > 0) counts.mapValues { it.value.toDouble() / total } else emptyMap()
+        keysByName = cards.values.groupBy({ it.nameKey }, { it.key })
+            .mapValues { (_, keys) -> keys.sortedByDescending { recentUsage[it] ?: 0.0 } }
+    }
+
+    /**
+     * Maps a stored key to a key in this dataset. Older history entries use the plain
+     * name; if that name is now split into variants, the most played one is returned.
+     */
+    fun resolve(key: String): String? {
+        if (key in cards) return key
+        val nameKey = key.substringBefore('#')
+        return keysByName[nameKey]?.firstOrNull()
+    }
+
+    private companion object {
+        fun applyVariants(input: List<TournamentRecord>, variants: Map<String, CardVariant>): List<TournamentRecord> =
+            input.map { t ->
+                t.copy(entries = t.entries.map { e ->
+                    val cards = e.cards.map { c ->
+                        val v = if (c.category == CardCategory.Pokemon && c.set.isNotEmpty()) {
+                            variants[CardVariants.printId(c.set, c.number)]?.key
+                        } else null
+                        if (v != c.variant) c.copy(variant = v) else c
+                    }
+                    e.copy(cards = cards, cardKeys = cards.map { it.key }.toSet())
+                })
+            }
     }
 
     fun tournament(id: String): TournamentRecord? = tournaments.firstOrNull { it.id == id }

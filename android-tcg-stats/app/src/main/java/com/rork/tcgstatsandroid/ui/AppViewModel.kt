@@ -98,7 +98,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 statsCache.keys.removeAll { it.startsWith("${src.name}|") }
                 _state.update { s ->
                     val history = if (s.source == src) {
-                        s.history.map { it.copy(usage = dataset.recentUsage[it.card.key] ?: 0.0) }
+                        s.history.map { h -> h.copy(usage = dataset.resolve(h.card.key)?.let { dataset.recentUsage[it] } ?: 0.0) }
                     } else s.history
                     s.copy(
                         datasets = s.datasets + (src to dataset),
@@ -137,20 +137,21 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         val dataset = s.dataset ?: return null
         val cacheKey = "${s.source.name}|$key|${window.name}|${System.identityHashCode(dataset)}"
         statsCache[cacheKey]?.let { return it }
-        val stats = dataset.stats(key, window) ?: return null
+        val stats = dataset.resolve(key)?.let { dataset.stats(it, window) } ?: return null
         statsCache[cacheKey] = stats
         return stats
     }
 
     fun identity(key: String): CardIdentity? {
         val s = _state.value
-        return s.dataset?.cards?.get(key) ?: s.history.firstOrNull { it.card.key == key }?.card
+        return s.dataset?.let { d -> d.resolve(key)?.let { d.cards[it] } } ?: s.history.firstOrNull { it.card.key == key }?.card
     }
 
     /** Selects a card for the Results tab and records it in history. Returns false if unknown. */
-    fun showResults(key: String): Boolean {
+    fun showResults(requested: String): Boolean {
         val s = _state.value
         val dataset = s.dataset ?: return false
+        val key = dataset.resolve(requested) ?: return false
         val card = dataset.cards[key] ?: return false
         val usage = dataset.recentUsage[key] ?: 0.0
         val history = listOf(HistoryEntry(card, usage, System.currentTimeMillis())) +

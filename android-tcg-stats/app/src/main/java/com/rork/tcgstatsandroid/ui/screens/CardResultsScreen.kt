@@ -127,12 +127,13 @@ fun CardResultsScreen(
                     if (stats != null) {
                         HeroSection(stats)
                         TrendSection(stats, window, onWindow = { window = it })
-                        TopDecksSection(stats, onSeeAll = { actions.openAllDecks(cardKey, window) }, onDeck = { actions.openDeck(cardKey, it, window) })
+                        val key = stats.card.key
+                        TopDecksSection(stats, onSeeAll = { actions.openAllDecks(key, window) }, onDeck = { actions.openDeck(key, it, window) })
                         TournamentsSection(
                             stats = stats,
                             isOfficial = state.source == DataSource.Official,
-                            onSeeAll = { actions.openAllTournaments(cardKey, window) },
-                            onOpen = { actions.openTournament(it, cardKey) },
+                            onSeeAll = { actions.openAllTournaments(key, window) },
+                            onOpen = { actions.openTournament(it, key) },
                         )
                         ResultsFooter(stats, state.source)
                     } else {

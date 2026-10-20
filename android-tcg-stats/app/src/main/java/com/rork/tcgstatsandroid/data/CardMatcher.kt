@@ -7,11 +7,15 @@ data class RecognizedLine(val text: String, val midY: Double)
 class CardMatcher(dataset: CardDataset) {
     private class Candidate(val key: String, val padded: String, val basePadded: String?)
 
-    private val keys: Set<String> = dataset.cards.keys
-    private val candidates: List<Candidate> = dataset.cards.keys.map { key ->
+    /** Matching runs on plain names; variants of a name are resolved afterwards. */
+    private val keys: Set<String> = dataset.keysByName.keys
+    private val candidates: List<Candidate> = keys.map { key ->
         val base = if (key.endsWith(" ex")) key.dropLast(3) else null
         Candidate(key, " $key ", base?.let { " $it " })
     }
+    private val keysByName = dataset.keysByName
+    private val variantMoves: Map<String, List<String>> =
+        dataset.variantMoves.mapValues { (_, moves) -> moves.map(CardText::normalize).filter { it.length >= 3 } }
     private val printIndex = dataset.printIndex
     private val setCodes = dataset.setCodes
     private val numberRegex = Regex("(\\d{1,3})\\s*/\\s*(\\d{2,3})")
@@ -48,7 +52,19 @@ class CardMatcher(dataset: CardDataset) {
                 }
             }
         }
-        return if (bestScore >= 7) bestKey else null
+        val name = if (bestScore >= 7) bestKey else null
+        return name?.let { resolveVariant(it, full) }
+    }
+
+    /** Picks the variant whose attack or ability names appear on the card, else the most played. */
+    private fun resolveVariant(nameKey: String, full: String): String? {
+        val options = keysByName[nameKey] ?: return null
+        if (options.size == 1) return options.first()
+        val padded = " $full "
+        return options.maxByOrNull { key ->
+            variantMoves[key].orEmpty().count { padded.contains(" $it ") }
+        }?.takeIf { key -> variantMoves[key].orEmpty().any { padded.contains(" $it ") } }
+            ?: options.first()
     }
 
     private fun matchPrint(fullRaw: String): String? {

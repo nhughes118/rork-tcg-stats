@@ -148,7 +148,7 @@ object LimitlessClient {
         return TournamentRecord(t.id, t.name, t.date, t.players, entries, DataSource.Online)
     }
 
-    private suspend fun loadOnline(context: Context, progress: (Double) -> Unit): CardDataset {
+    private suspend fun loadOnline(context: Context, progress: (Double) -> Unit): List<TournamentRecord> {
         val now = System.currentTimeMillis()
         progress(0.03)
         val listText = httpGet("$BASE/tournaments?game=PTCG&format=STANDARD&limit=1000", "application/json")
@@ -170,12 +170,12 @@ object LimitlessClient {
         }.filterNotNull().filter { it.entries.isNotEmpty() }
         records.forEach { saveCache(context, it) }
         if (records.isEmpty()) throw LimitlessException(NO_DATA)
-        return CardDataset(records, now)
+        return records
     }
 
     // Official (limitlesstcg.com scraping)
 
-    private suspend fun loadOfficial(context: Context, progress: (Double) -> Unit): CardDataset = coroutineScope {
+    private suspend fun loadOfficial(context: Context, progress: (Double) -> Unit): List<TournamentRecord> = coroutineScope {
         val now = System.currentTimeMillis()
         progress(0.03)
         // Primary: the homepage "Recent Tournaments" block. Secondary: older completed events for trend depth.
@@ -240,13 +240,20 @@ object LimitlessClient {
             records += record
         }
         if (records.isEmpty()) throw LimitlessException(NO_DATA)
-        CardDataset(records, now)
+        records
     }
 
     /** Loads the dataset, reporting progress between 0 and 1 (may be called off the main thread). */
-    suspend fun loadDataset(context: Context, source: DataSource, progress: (Double) -> Unit): CardDataset =
-        when (source) {
-            DataSource.Online -> loadOnline(context, progress)
-            DataSource.Official -> loadOfficial(context, progress)
+    suspend fun loadDataset(context: Context, source: DataSource, progress: (Double) -> Unit): CardDataset {
+        val now = System.currentTimeMillis()
+        val records = when (source) {
+            DataSource.Online -> loadOnline(context) { progress(it * 0.85) }
+            DataSource.Official -> loadOfficial(context) { progress(it * 0.85) }
         }
+        // Split Pokémon names that cover several distinct cards (e.g. Fire vs Darkness Chi-Yu).
+        val variants = runCatching { CardVariants.resolve(context, records) { progress(0.85 + 0.15 * it) } }
+            .getOrElse { emptyMap() }
+        progress(1.0)
+        return CardDataset(records, now, variants)
+    }
 }

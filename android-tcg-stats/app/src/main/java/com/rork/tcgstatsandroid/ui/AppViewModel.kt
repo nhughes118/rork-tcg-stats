@@ -90,9 +90,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 val context = getApplication<Application>()
                 val (dataset, matcher, popular) = withContext(Dispatchers.Default) {
                     val result = LimitlessClient.loadDataset(context, src) { value -> reportProgress(src, value) }
-                    val popular = result.recentUsage.entries
-                        .sortedByDescending { it.value }
-                        .mapNotNull { (key, usage) -> result.cards[key]?.let { PopularCard(it, usage) } }
+                    // Every card in the window is searchable, even ones not played recently.
+                    val popular = result.cards.values
+                        .map { PopularCard(it, result.recentUsage[it.key] ?: 0.0) }
+                        .sortedWith(compareByDescending<PopularCard> { it.usage }.thenBy { it.card.name })
                     Triple(result, CardMatcher(result), popular)
                 }
                 statsCache.keys.removeAll { it.startsWith("${src.name}|") }

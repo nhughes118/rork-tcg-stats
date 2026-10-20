@@ -8,10 +8,22 @@ nonisolated struct CardDataset: Sendable {
     let setCodes: Set<String>
     let recentUsage: [String: Double]
     let generatedAt: Date
+    /// Card keys per plain name, most played first (several when a name covers distinct cards).
+    let keysByName: [String: [String]]
+    /// Attack/ability names for variant keys, used to disambiguate scans.
+    let variantMoves: [String: [String]]
 
-    init(tournaments: [TournamentRecord], now: Date = .now) {
+    init(tournaments input: [TournamentRecord], now: Date = .now, variants: [String: CardVariant] = [:]) {
+        let tournaments = Self.applyVariants(input, variants)
         self.tournaments = tournaments.sorted { $0.date > $1.date }
         self.generatedAt = now
+        var notes: [String: String] = [:]
+        var moves: [String: [String]] = [:]
+        for v in variants.values {
+            notes[v.key] = v.note
+            moves[v.key] = v.moves
+        }
+        self.variantMoves = moves
 
         var printCounts: [String: [CardIdentity: Int]] = [:]
         var prints: [String: String] = [:]
@@ -19,7 +31,10 @@ nonisolated struct CardDataset: Sendable {
         for t in tournaments {
             for e in t.entries {
                 for c in e.cards {
-                    let identity = CardIdentity(name: c.name, set: c.set, number: c.number, category: c.category)
+                    let identity = CardIdentity(
+                        name: c.name, set: c.set, number: c.number, category: c.category,
+                        variant: c.variant, note: c.variant.flatMap { notes[$0] }
+                    )
                     printCounts[c.key, default: [:]][identity, default: 0] += 1
                     if !c.set.isEmpty {
                         sets.insert(c.set)
@@ -52,6 +67,36 @@ nonisolated struct CardDataset: Sendable {
             for (k, v) in counts { usage[k] = Double(v) / Double(total) }
         }
         self.recentUsage = usage
+        var byName: [String: [String]] = [:]
+        for card in cards.values { byName[card.nameKey, default: []].append(card.key) }
+        self.keysByName = byName.mapValues { keys in keys.sorted { (usage[$0] ?? 0) > (usage[$1] ?? 0) } }
+    }
+
+    /// Maps a stored key to a key in this dataset. Older history entries use the plain
+    /// name; if that name is now split into variants, the most played one is returned.
+    func resolve(_ key: String) -> String? {
+        if cards[key] != nil { return key }
+        let nameKey = String(key.split(separator: "~", maxSplits: 1).first ?? Substring(key))
+        return keysByName[nameKey]?.first
+    }
+
+    private static func applyVariants(_ input: [TournamentRecord], _ variants: [String: CardVariant]) -> [TournamentRecord] {
+        guard !variants.isEmpty else { return input }
+        return input.map { t in
+            let entries = t.entries.map { e -> PlayerEntry in
+                let cards = e.cards.map { c -> DeckCard in
+                    var card = c
+                    card.variant = (c.category == .pokemon && !c.set.isEmpty)
+                        ? variants[CardVariants.printID(set: c.set, number: c.number)]?.key : nil
+                    return card
+                }
+                return PlayerEntry(
+                    id: e.id, name: e.name, placing: e.placing, wins: e.wins, losses: e.losses, ties: e.ties,
+                    deckName: e.deckName, deckIcons: e.deckIcons, cards: cards, cardKeys: Set(cards.map(\.key))
+                )
+            }
+            return TournamentRecord(id: t.id, name: t.name, date: t.date, players: t.players, entries: entries, source: t.source)
+        }
     }
 
     var totalDecklists: Int { tournaments.reduce(0) { $0 + $1.entries.count } }

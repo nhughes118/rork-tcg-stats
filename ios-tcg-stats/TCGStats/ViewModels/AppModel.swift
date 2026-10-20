@@ -90,9 +90,10 @@ final class AppModel {
             for key in statsCache.keys where key.hasPrefix("\(src.rawValue)|") {
                 statsCache.removeValue(forKey: key)
             }
-            popularBySource[src] = result.recentUsage
-                .sorted { $0.value > $1.value }
-                .compactMap { key, usage in result.cards[key].map { PopularCard(card: $0, usage: usage) } }
+            // Every card in the window is searchable, even ones not played recently.
+            popularBySource[src] = result.cards.values
+                .map { PopularCard(card: $0, usage: result.recentUsage[$0.key] ?? 0) }
+                .sorted { ($0.usage, $1.card.name) > ($1.usage, $0.card.name) }
             refreshHistoryUsage()
             states[src] = .loaded
         } catch {
@@ -107,18 +108,19 @@ final class AppModel {
     func stats(for key: String, window: StatsWindow) -> CardStats? {
         let cacheKey = "\(source.rawValue)|\(key)|\(window.rawValue)"
         if let cached = statsCache[cacheKey] { return cached }
-        guard let stats = dataset?.stats(for: key, window: window) else { return nil }
+        guard let dataset, let resolved = dataset.resolve(key),
+              let stats = dataset.stats(for: resolved, window: window) else { return nil }
         statsCache[cacheKey] = stats
         return stats
     }
 
     func identity(for key: String) -> CardIdentity? {
-        dataset?.cards[key] ?? history.first { $0.card.key == key }?.card
+        dataset.flatMap { d in d.resolve(key).flatMap { d.cards[$0] } } ?? history.first { $0.card.key == key }?.card
     }
 
     /// Opens results for a card on the Results tab and records it in history.
-    func showResults(for key: String) {
-        guard let card = dataset?.cards[key] else { return }
+    func showResults(for requested: String) {
+        guard let key = dataset?.resolve(requested), let card = dataset?.cards[key] else { return }
         currentCardKey = key
         resultsPath = []
         selectedTab = .results
@@ -142,7 +144,7 @@ final class AppModel {
     private func refreshHistoryUsage() {
         guard let dataset else { return }
         for i in history.indices {
-            history[i].usage = dataset.recentUsage[history[i].card.key] ?? 0
+            history[i].usage = dataset.resolve(history[i].card.key).flatMap { dataset.recentUsage[$0] } ?? 0
         }
         HistoryStore.save(history)
     }

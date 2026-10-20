@@ -97,6 +97,7 @@ object CardVariants {
                     semaphore.withPermit {
                         val (set, number) = id.split("-", limit = 2).let { it[0] to it.getOrElse(1) { "" } }
                         runCatching { parse(OfficialLimitless.fetchPage("/cards/$set/$number")) }
+                            .onFailure { android.util.Log.w("TCGStats", "Card page $id failed: ${it.javaClass.simpleName}") }
                             .getOrNull()?.let { known[id] = it }
                         progress(done.incrementAndGet().toDouble() / missing.size)
                     }
@@ -112,9 +113,10 @@ object CardVariants {
             for ((_, members) in groups) {
                 val fp = members.first().second
                 val label = fp.moves.firstOrNull() ?: fp.type
-                val slug = CardText.normalize(fp.moves.joinToString(" ").ifEmpty { "${fp.type} ${fp.hp}" }).replace(' ', '-')
+                val slug = CardText.normalize(fp.moves.joinToString(" ").ifEmpty { "${fp.type} ${fp.hp}" })
+                    .filter { it.isLetterOrDigit() || it == ' ' }.trim().replace(' ', '-')
                 val note = listOf(fp.type, fp.moves.firstOrNull()).filter { !it.isNullOrEmpty() }.joinToString(" · ")
-                val variant = CardVariant("$nameKey#$slug", note.ifEmpty { label }, fp.moves)
+                val variant = CardVariant("$nameKey~$slug", note.ifEmpty { label }, fp.moves)
                 members.forEach { (id, _) -> result[id] = variant }
             }
         }

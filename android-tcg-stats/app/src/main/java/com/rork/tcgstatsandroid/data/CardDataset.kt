@@ -80,7 +80,7 @@ class CardDataset(
      */
     fun resolve(key: String): String? {
         if (key in cards) return key
-        val nameKey = key.substringBefore('#')
+        val nameKey = key.substringBefore('~').substringBefore('#')
         return keysByName[nameKey]?.firstOrNull()
     }
 

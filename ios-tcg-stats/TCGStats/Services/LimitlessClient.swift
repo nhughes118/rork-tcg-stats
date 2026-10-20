@@ -28,7 +28,7 @@ nonisolated enum LimitlessClient {
     static let perWeek = 3
     static let minPlayers = 32
     /// Official events list every finisher; decklists are fetched for the top N only.
-    static let officialListLimit = 32
+    static let officialListLimit = 64
     /// Maximum official events (homepage recent + older completed) per load.
     static let officialMaxEvents = 8
 
@@ -50,7 +50,7 @@ nonisolated enum LimitlessClient {
     private static func cacheDirectory(_ source: DataSource) -> URL {
         let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("tournaments", isDirectory: true)
-            .appendingPathComponent(source.rawValue, isDirectory: true)
+            .appendingPathComponent("\(source.rawValue)-v2", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
     }
@@ -304,9 +304,15 @@ nonisolated enum LimitlessClient {
 
     /// Loads the dataset, reporting progress between 0 and 1.
     static func loadDataset(source: DataSource, progress: @escaping @Sendable (Double) -> Void) async throws -> CardDataset {
-        switch source {
-        case .online: try await loadOnline(progress: progress)
-        case .official: try await loadOfficial(progress: progress)
+        let scaled: @Sendable (Double) -> Void = { progress($0 * 0.85) }
+        let base: CardDataset = switch source {
+        case .online: try await loadOnline(progress: scaled)
+        case .official: try await loadOfficial(progress: scaled)
         }
+        // Split Pokémon names that cover several distinct cards (e.g. Fire vs Darkness Chi-Yu).
+        let variants = await CardVariants.resolve(base.tournaments) { progress(0.85 + 0.15 * $0) }
+        progress(1)
+        guard !variants.isEmpty else { return base }
+        return CardDataset(tournaments: base.tournaments, now: base.generatedAt, variants: variants)
     }
 }

@@ -21,8 +21,8 @@ struct CardResultsView: View {
                 if let stats {
                     HeroSection(stats: stats, window: window)
                     TrendSection(stats: stats, window: $window)
-                    TopDecksSection(stats: stats, cardKey: cardKey, window: window)
-                    TournamentsSection(stats: stats, cardKey: cardKey, window: window)
+                    TopDecksSection(stats: stats, cardKey: stats.card.key, window: window)
+                    TournamentsSection(stats: stats, cardKey: stats.card.key, window: window)
                     footer(stats: stats)
                 } else {
                     ResultsPlaceholder(card: model.identity(for: cardKey))

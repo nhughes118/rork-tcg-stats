@@ -35,7 +35,7 @@ object LimitlessClient {
     private const val PER_WEEK = 3
     private const val MIN_PLAYERS = 32
     /** Official events list every finisher; decklists are fetched for the top N only. */
-    const val OFFICIAL_LIST_LIMIT = 32
+    const val OFFICIAL_LIST_LIMIT = 64
     /** Maximum official events (homepage recent + older completed) per load. */
     private const val OFFICIAL_MAX_EVENTS = 8
 
@@ -74,7 +74,7 @@ object LimitlessClient {
     }
 
     private fun cacheDir(context: Context, source: DataSource): File =
-        File(context.cacheDir, "tournaments/${source.name.lowercase()}").apply { mkdirs() }
+        File(context.cacheDir, "tournaments/${source.name.lowercase()}-v2").apply { mkdirs() }
 
     private fun cachedRecord(context: Context, id: String, source: DataSource): TournamentRecord? {
         val file = File(cacheDir(context, source), "$id.json")
@@ -253,6 +253,7 @@ object LimitlessClient {
         // Split Pokémon names that cover several distinct cards (e.g. Fire vs Darkness Chi-Yu).
         val variants = runCatching { CardVariants.resolve(context, records) { progress(0.85 + 0.15 * it) } }
             .getOrElse { emptyMap() }
+        android.util.Log.i("TCGStats", "Loaded ${records.size} ${source.name} events, ${variants.values.map { it.key }.toSet().size} card variants")
         progress(1.0)
         return CardDataset(records, now, variants)
     }

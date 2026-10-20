@@ -28,8 +28,11 @@ nonisolated struct DeckCard: Codable, Hashable, Sendable {
     let set: String
     let number: String
     let category: CardCategory
+    /// Variant key when this name covers several distinct cards (see `CardVariants`).
+    var variant: String? = nil
 
-    var key: String { CardText.key(name) }
+    var nameKey: String { CardText.key(name) }
+    var key: String { variant ?? nameKey }
 }
 
 /// A printed card used to represent a card name (image, set, number).
@@ -38,9 +41,18 @@ nonisolated struct CardIdentity: Codable, Hashable, Sendable {
     let set: String
     let number: String
     let category: CardCategory
+    /// Variant key when the name covers several distinct cards.
+    var variant: String? = nil
+    /// Short distinguishing text for variants, e.g. "Darkness · Whirling Envy".
+    var note: String? = nil
 
-    var key: String { CardText.key(name) }
-    var printLabel: String { self.set.isEmpty ? category.title : "\(self.set) \(number)" }
+    var nameKey: String { CardText.key(name) }
+    var key: String { variant ?? nameKey }
+    var printLabel: String {
+        let base = self.set.isEmpty ? category.title : "\(self.set) \(number)"
+        guard let note, !note.isEmpty else { return base }
+        return "\(base) · \(note)"
+    }
 
     func imageURL(large: Bool = false) -> URL? {
         guard !set.isEmpty, !number.isEmpty else { return nil }

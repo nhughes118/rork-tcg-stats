@@ -122,8 +122,8 @@ fun CardResultsScreen(
                         BrandHeader(Modifier.padding(top = 8.dp)) {
                             ResultsMenu(stats, actions, onRefresh = { vm.load(force = true) })
                         }
-                        SourcePicker(state.source, onSelect = vm::selectSource)
                     }
+                    SourcePicker(state.source, onSelect = vm::selectSource)
                     if (stats != null) {
                         HeroSection(stats)
                         TrendSection(stats, window, onWindow = { window = it })
@@ -140,6 +140,7 @@ fun CardResultsScreen(
                         ResultsPlaceholder(
                             card = vm.identity(cardKey),
                             loadState = state.loadState,
+                            isOfficial = state.source == DataSource.Official,
                             onRetry = { vm.load(force = true) },
                         )
                     }
@@ -324,7 +325,7 @@ private fun ResultsFooter(stats: CardStats, source: DataSource) {
 }
 
 @Composable
-private fun ResultsPlaceholder(card: CardIdentity?, loadState: LoadState, onRetry: () -> Unit) {
+private fun ResultsPlaceholder(card: CardIdentity?, loadState: LoadState, isOfficial: Boolean, onRetry: () -> Unit) {
     Column(
         Modifier.fillMaxWidth().padding(top = 40.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -345,7 +346,8 @@ private fun ResultsPlaceholder(card: CardIdentity?, loadState: LoadState, onRetr
                 Button(onClick = onRetry, colors = ButtonDefaults.buttonColors(containerColor = Palette.Blue)) { Text("Try Again") }
             }
             LoadState.Loaded -> Text(
-                "This card hasn't appeared in recent tournament decklists.",
+                if (isOfficial) "This card hasn't appeared in recent official tournament decklists. Try Online."
+                else "This card hasn't appeared in recent online tournament decklists. Try Official.",
                 fontSize = 15.sp,
                 color = Palette.Muted,
                 textAlign = TextAlign.Center,

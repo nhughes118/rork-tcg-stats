@@ -16,8 +16,8 @@ struct CardResultsView: View {
                 if isTabRoot {
                     BrandHeader { menu(stats: stats) }
                         .padding(.top, 4)
-                    SourcePicker()
                 }
+                SourcePicker()
                 if let stats {
                     HeroSection(stats: stats, window: window)
                     TrendSection(stats: stats, window: $window)
@@ -395,7 +395,9 @@ private struct ResultsPlaceholder: View {
                     .buttonStyle(.borderedProminent)
                     .tint(Theme.blue)
             case .loaded:
-                Text("This card hasn't appeared in recent tournament decklists.")
+                Text(model.source == .official
+                     ? "This card hasn't appeared in recent official tournament decklists. Try Online."
+                     : "This card hasn't appeared in recent online tournament decklists. Try Official.")
                     .font(.subheadline).foregroundStyle(Theme.muted).multilineTextAlignment(.center)
             default:
                 LoadingCard()

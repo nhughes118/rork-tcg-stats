@@ -92,7 +92,9 @@ nonisolated enum EventLocator {
         if responses.isEmpty {
             throw EventLocatorError(message: "Pokémon's event site didn't respond. Try again, or open it on Pokémon.com.")
         }
-        return await Task.detached { parse(responses, origin: point, rangeMiles: rangeMiles) }.value
+        let events = await Task.detached { parse(responses, origin: point, rangeMiles: rangeMiles) }.value
+        print("[Events] \(responses.count) responses -> \(events.count) events")
+        return events
     }
 
     // MARK: Parsing
@@ -174,7 +176,7 @@ nonisolated enum EventLocator {
               let startRaw = text(o, "start_datetime", "start_date", "startdate", "when") else { return nil }
         let address = object(o, "address", "location")
         let group = object(o, "activityGroup", "activity_group", "store")
-        let typeName = text(parent, "EventTypeName", "EventBadge") ?? text(o, "EventType", "event_type")
+        let typeName = text(parent, "EventTypeName", "EvenTypeName", "EventBadge") ?? text(o, "EventType", "event_type")
 
         let lat = number(address, "latitude", "lat") ?? number(o, "latitude", "lat")
         let lng = number(address, "longitude", "lng", "lon") ?? number(o, "longitude", "lng", "lon")
@@ -295,10 +297,23 @@ final class EventPageLoader: NSObject, WKScriptMessageHandler, WKNavigationDeleg
         let body: String
     }
 
+    /// The Event Locator only runs its event search on load when its stored client variables say a search
+    /// is in progress (`AreEventsBeingSearched`) in events mode (`IsShowEvents`). A fresh web view has neither,
+    /// so the page would just show its landing state. This hook forces both on, captures the data responses,
+    /// and as a last resort writes the variables and reloads once.
     private static let hookJS = """
     (function(){
       if (window.__tcgHooked) return; window.__tcgHooked = true;
-      function send(u, b){ try { if (u && String(u).indexOf('screenservices') >= 0) window.webkit.messageHandlers.tcgEvents.postMessage({url:String(u), body:String(b)}); } catch(e){} }
+      var D = String.fromCharCode(36), MARK = D + 'ClientVars' + D, FORCE = ['AreEventsBeingSearched', 'IsShowEvents'];
+      var SP = Storage.prototype, og = SP.getItem, osi = SP.setItem;
+      function forced(k){ k = String(k); var i = k.indexOf(MARK); if (i < 0) return false; return FORCE.indexOf(k.substring(i + MARK.length)) >= 0; }
+      function truthy(v){ if (v === 'True' || v === 'False') return 'True'; if (v === '1' || v === '0') return '1'; return 'true'; }
+      try { SP.getItem = function(k){ var v = og.apply(this, arguments); try { if (forced(k)) return truthy(v); } catch(e){} return v; }; } catch(e){}
+      function prime(){ try { var s = window.localStorage, pre = null; for (var i = 0; i < s.length; i++){ var k = s.key(i), j = k.indexOf(MARK); if (j >= 0 && k.indexOf('EventLocator') >= 0){ pre = k.substring(0, j + MARK.length); break; } } if (!pre) return false; var changed = false; FORCE.forEach(function(n){ var v = og.call(s, pre + n); if (v !== truthy(v)) { osi.call(s, pre + n, truthy(v)); changed = true; } }); return changed; } catch(e){ return false; } }
+      prime();
+      function arm(){ setTimeout(function(){ try { if (window.__tcgSawEvents) return; var ss = window.sessionStorage; if (og.call(ss, '__tcgReloaded')) return; if (prime()) { osi.call(ss, '__tcgReloaded', '1'); location.reload(); } } catch(e){} }, 7000); }
+      if (document.readyState === 'complete') arm(); else window.addEventListener('load', arm);
+      function send(u, b){ try { if (u && String(u).indexOf('screenservices') >= 0) { if (String(u).indexOf('GetEventList') >= 0) window.__tcgSawEvents = true; window.webkit.messageHandlers.tcgEvents.postMessage({url:String(u), body:String(b)}); } } catch(e){} }
       var oo = XMLHttpRequest.prototype.open, os = XMLHttpRequest.prototype.send;
       XMLHttpRequest.prototype.open = function(m, u){ this.__tcgUrl = u; return oo.apply(this, arguments); };
       XMLHttpRequest.prototype.send = function(){ var x = this; x.addEventListener('load', function(){ try { send(x.responseURL || x.__tcgUrl, x.responseText); } catch(e){} }); return os.apply(this, arguments); };
@@ -312,6 +327,7 @@ final class EventPageLoader: NSObject, WKScriptMessageHandler, WKNavigationDeleg
     private var quietTask: Task<Void, Never>?
     private var timeoutTask: Task<Void, Never>?
     private var sawEventList = false
+    private var sawLocations = false
 
     func load(_ url: URL, timeout: Duration = .seconds(35)) async -> [Captured] {
         await withTaskCancellationHandler {
@@ -354,13 +370,15 @@ final class EventPageLoader: NSObject, WKScriptMessageHandler, WKNavigationDeleg
               let url = dict["url"] as? String,
               let body = dict["body"] as? String else { return }
         captured.append(Captured(url: url, body: body))
-        if url.localizedCaseInsensitiveContains("GetEventList") || url.localizedCaseInsensitiveContains("GetLocations") {
-            sawEventList = true
-        }
-        if sawEventList {
+        if url.localizedCaseInsensitiveContains("GetEventList") { sawEventList = true }
+        if url.localizedCaseInsensitiveContains("GetLocations") { sawLocations = true }
+        print("[Events] captured \(url.split(separator: "/").last ?? "") (\(body.count) bytes)")
+        // Event lists arrive in batches; a store-only response may still be followed by a reload into events mode.
+        if sawEventList || sawLocations {
+            let wait: Duration = sawEventList ? .seconds(3) : .seconds(10)
             quietTask?.cancel()
             quietTask = Task { [weak self] in
-                try? await Task.sleep(for: .seconds(2))
+                try? await Task.sleep(for: wait)
                 guard !Task.isCancelled else { return }
                 self?.finish()
             }

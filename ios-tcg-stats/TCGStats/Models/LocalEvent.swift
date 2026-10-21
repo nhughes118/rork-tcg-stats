@@ -51,10 +51,17 @@ nonisolated struct LocalEvent: Identifiable, Hashable, Sendable {
     let cost: String?
     let link: String?
 
+    /// Hides only events that are clearly for other games (VG, GO, UNITE); unknown product formats stay visible.
     var isTCG: Bool {
-        products.isEmpty
-            || products.contains { $0.localizedCaseInsensitiveContains("tcg") || $0.localizedCaseInsensitiveContains("trading card") }
-            || name.localizedCaseInsensitiveContains("tcg")
+        if name.localizedCaseInsensitiveContains("tcg") || products.isEmpty { return true }
+        if products.contains(where: { $0.localizedCaseInsensitiveContains("tcg") || $0.localizedCaseInsensitiveContains("trading card") }) {
+            return true
+        }
+        let otherGame = ["video game", "videogame", "vg", "go", "pokémon go", "pokemon go", "unite", "pokémon unite", "pokemon unite"]
+        return !products.allSatisfy { p in
+            let t = p.lowercased().trimmingCharacters(in: .whitespaces)
+            return otherGame.contains(t) || t.contains("video game") || t.hasSuffix(" go") || t.contains("unite")
+        }
     }
 
     var badgeLabel: String { kind == .other ? (typeName ?? kind.rawValue) : kind.rawValue }

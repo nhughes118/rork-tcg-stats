@@ -6,6 +6,7 @@ import android.content.Context
 import android.location.Geocoder
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
@@ -65,9 +66,17 @@ data class LocalEvent(
     val cost: String?,
     val link: String?,
 ) {
+    /** Hides only events clearly for other games (VG, GO, UNITE); unknown product formats stay visible. */
     val isTcg: Boolean
-        get() = products.isEmpty() || products.any { it.contains("tcg", true) || it.contains("trading card", true) } ||
-            name.contains("tcg", true)
+        get() {
+            if (name.contains("tcg", true) || products.isEmpty()) return true
+            if (products.any { it.contains("tcg", true) || it.contains("trading card", true) }) return true
+            val otherGame = setOf("video game", "videogame", "vg", "go", "pokémon go", "pokemon go", "unite")
+            return !products.all { p ->
+                val t = p.trim().lowercase(Locale.US)
+                t in otherGame || t.contains("video game") || t.endsWith(" go") || t.contains("unite")
+            }
+        }
 
     private fun zone(): TimeZone = timeZone?.let { TimeZone.getTimeZone(it) } ?: TimeZone.getDefault()
 
@@ -146,10 +155,23 @@ object EventLocator {
 
     // ---------- Fetching (hidden WebView) ----------
 
+    // The Event Locator only runs its event search on load when its stored client variables say a search is in
+    // progress (AreEventsBeingSearched) in events mode (IsShowEvents). A fresh WebView has neither, so the page
+    // would just show its landing state. This hook forces both on, captures the data responses, and as a last
+    // resort writes the variables and reloads once.
     private const val HOOK_JS = """
 (function(){
   if (window.__tcgHooked) return; window.__tcgHooked = true;
-  function send(u, b){ try { if (u && String(u).indexOf('screenservices') >= 0 && window.TCGEvents) window.TCGEvents.post(JSON.stringify({url:String(u), body:String(b)})); } catch(e){} }
+  var D = String.fromCharCode(36), MARK = D + 'ClientVars' + D, FORCE = ['AreEventsBeingSearched', 'IsShowEvents'];
+  var SP = Storage.prototype, og = SP.getItem, osi = SP.setItem;
+  function forced(k){ k = String(k); var i = k.indexOf(MARK); if (i < 0) return false; return FORCE.indexOf(k.substring(i + MARK.length)) >= 0; }
+  function truthy(v){ if (v === 'True' || v === 'False') return 'True'; if (v === '1' || v === '0') return '1'; return 'true'; }
+  try { SP.getItem = function(k){ var v = og.apply(this, arguments); try { if (forced(k)) return truthy(v); } catch(e){} return v; }; } catch(e){}
+  function prime(){ try { var s = window.localStorage, pre = null; for (var i = 0; i < s.length; i++){ var k = s.key(i), j = k.indexOf(MARK); if (j >= 0 && k.indexOf('EventLocator') >= 0){ pre = k.substring(0, j + MARK.length); break; } } if (!pre) return false; var changed = false; FORCE.forEach(function(n){ var v = og.call(s, pre + n); if (v !== truthy(v)) { osi.call(s, pre + n, truthy(v)); changed = true; } }); return changed; } catch(e){ return false; } }
+  prime();
+  function arm(){ setTimeout(function(){ try { if (window.__tcgSawEvents) return; var ss = window.sessionStorage; if (og.call(ss, '__tcgReloaded')) return; if (prime()) { osi.call(ss, '__tcgReloaded', '1'); location.reload(); } } catch(e){} }, 7000); }
+  if (document.readyState === 'complete') arm(); else window.addEventListener('load', arm);
+  function send(u, b){ try { if (u && String(u).indexOf('screenservices') >= 0 && window.TCGEvents) { if (String(u).indexOf('GetEventList') >= 0) window.__tcgSawEvents = true; window.TCGEvents.post(JSON.stringify({url:String(u), body:String(b)})); } } catch(e){} }
   var oo = XMLHttpRequest.prototype.open, os = XMLHttpRequest.prototype.send;
   XMLHttpRequest.prototype.open = function(m, u){ this.__tcgUrl = u; return oo.apply(this, arguments); };
   XMLHttpRequest.prototype.send = function(){ var x = this; x.addEventListener('load', function(){ try { send(x.responseURL || x.__tcgUrl, x.responseText); } catch(e){} }); return os.apply(this, arguments); };
@@ -167,6 +189,7 @@ object EventLocator {
         val handler = Handler(Looper.getMainLooper())
         val finish = Runnable { finished.complete(Unit) }
         var sawEventList = false
+        var sawLocations = false
 
         val web = WebView(activity)
         web.settings.javaScriptEnabled = true
@@ -182,10 +205,13 @@ object EventLocator {
                     val u = obj.str("url") ?: return@post
                     val b = obj.str("body") ?: return@post
                     captured += Captured(u, b)
-                    if (u.contains("GetEventList", true) || u.contains("GetLocations", true)) sawEventList = true
-                    if (sawEventList) {
+                    if (u.contains("GetEventList", true)) sawEventList = true
+                    if (u.contains("GetLocations", true)) sawLocations = true
+                    Log.d("Events", "captured ${u.substringAfterLast('/')} (${b.length} bytes)")
+                    // Event lists arrive in batches; a store-only response may still be followed by a reload into events mode.
+                    if (sawEventList || sawLocations) {
                         handler.removeCallbacks(finish)
-                        handler.postDelayed(finish, 2_000)
+                        handler.postDelayed(finish, if (sawEventList) 3_000 else 10_000)
                     }
                 }
             }
@@ -222,7 +248,9 @@ object EventLocator {
     suspend fun search(activity: Activity, point: GeoPoint, rangeMiles: Int): List<LocalEvent> {
         val responses = fetchResponses(activity, pageUrl(point.latitude, point.longitude, rangeMiles))
         if (responses.isEmpty()) throw EventLocatorException("Pokémon's event site didn't respond. Try again, or open it on Pokémon.com.")
-        return withContext(Dispatchers.Default) { parse(responses, point, rangeMiles) }
+        val events = withContext(Dispatchers.Default) { parse(responses, point, rangeMiles) }
+        Log.d("Events", "${responses.size} responses -> ${events.size} events")
+        return events
     }
 
     // ---------- Parsing ----------
@@ -295,7 +323,7 @@ object EventLocator {
         val startRaw = o.text("start_datetime", "start_date", "startdate", "when") ?: return null
         val address = o.obj("address", "location")
         val group = o.obj("activityGroup", "activity_group", "store")
-        val typeName = parent?.text("EventTypeName", "EventBadge") ?: o.text("EventType", "event_type")
+        val typeName = parent?.text("EventTypeName", "EvenTypeName", "EventBadge") ?: o.text("EventType", "event_type")
 
         val lat = address?.number("latitude", "lat") ?: o.number("latitude", "lat")
         val lng = address?.number("longitude", "lng", "lon") ?: o.number("longitude", "lng", "lon")

@@ -6,6 +6,9 @@ struct TournamentDetailView: View {
     let cardKey: String
 
     @State private var selectedEntry: PlayerEntry?
+    /// Decklist to re-present when returning from a card opened inside it.
+    @State private var reopenEntry: PlayerEntry?
+    @State private var pendingCardKey: String?
     @State private var showAll: Bool = false
 
     var body: some View {
@@ -124,9 +127,24 @@ struct TournamentDetailView: View {
         .navigationTitle(tournament?.name ?? "Tournament")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar(.hidden, for: .tabBar)
-        .sheet(item: $selectedEntry) { entry in
-            DecklistSheet(entry: entry, highlightKey: cardKey, tournamentName: tournament?.name)
+        .sheet(item: $selectedEntry, onDismiss: openPendingCard) { entry in
+            DecklistSheet(entry: entry, highlightKey: cardKey, tournamentName: tournament?.name) { key in
+                reopenEntry = entry
+                pendingCardKey = key
+                selectedEntry = nil
+            }
         }
+        .onAppear {
+            guard let entry = reopenEntry else { return }
+            reopenEntry = nil
+            selectedEntry = entry
+        }
+    }
+
+    private func openPendingCard() {
+        guard let key = pendingCardKey else { return }
+        pendingCardKey = nil
+        model.push(.card(key))
     }
 }
 

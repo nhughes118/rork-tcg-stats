@@ -53,7 +53,9 @@ fun TournamentScreen(vm: AppViewModel, tournamentId: String, cardKey: String, ac
     val state by vm.state.collectAsStateWithLifecycle()
     val tournament = remember(state.dataset, tournamentId) { state.dataset?.tournament(tournamentId) }
     val card = vm.identity(cardKey)
-    var selected by remember { mutableStateOf<PlayerEntry?>(null) }
+    // Saveable so the decklist sheet reopens when returning from a card opened inside it.
+    var selectedId by rememberSaveable { mutableStateOf<String?>(null) }
+    val selected = remember(tournament, selectedId) { selectedId?.let { id -> tournament?.entries?.firstOrNull { it.id == id } } }
     var showAll by rememberSaveable { mutableStateOf(false) }
     val uriHandler = LocalUriHandler.current
 
@@ -130,7 +132,7 @@ fun TournamentScreen(vm: AppViewModel, tournamentId: String, cardKey: String, ac
                 Column(Modifier.fillMaxWidth().cardSurface().padding(horizontal = 16.dp, vertical = 6.dp)) {
                     visible.forEachIndexed { index, entry ->
                         if (index > 0) RowDivider(start = 56.dp)
-                        FinisherRow(entry, Modifier.pressable { selected = entry }, copies = entry.copies(cardKey))
+                        FinisherRow(entry, Modifier.pressable { selectedId = entry.id }, copies = entry.copies(cardKey))
                     }
                     if (users.size > visible.size) {
                         RowDivider()
@@ -159,6 +161,6 @@ fun TournamentScreen(vm: AppViewModel, tournamentId: String, cardKey: String, ac
     }
 
     selected?.let { entry ->
-        DecklistSheet(entry, highlightKey = cardKey, tournamentName = tournament?.name, onDismiss = { selected = null })
+        DecklistSheet(entry, highlightKey = cardKey, tournamentName = tournament?.name, onOpenCard = actions.openCard, onDismiss = { selectedId = null })
     }
 }

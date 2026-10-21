@@ -15,6 +15,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
@@ -110,7 +111,9 @@ fun DeckEntriesScreen(
     val rows = remember(state.dataset, cardKey, deckName, window) {
         state.dataset?.entries(cardKey, deckName, window).orEmpty()
     }
-    var selected by remember { mutableStateOf<Pair<String, PlayerEntry>?>(null) }
+    // Saveable so the decklist sheet reopens when returning from a card opened inside it.
+    var selectedIndex by rememberSaveable { mutableStateOf<Int?>(null) }
+    val selected = selectedIndex?.let { rows.getOrNull(it) }?.let { (tournament, entry) -> tournament.name to entry }
     CanvasBackground(modifier) {
         Column(Modifier.fillMaxSize()) {
             DetailTopBar(deckName, onBack = actions.back)
@@ -122,7 +125,7 @@ fun DeckEntriesScreen(
                             if (index > 0) RowDivider(start = 56.dp)
                             FinisherRow(
                                 entry,
-                                Modifier.pressable { selected = tournament.name to entry },
+                                Modifier.pressable { selectedIndex = index },
                                 subtitle = tournament.name,
                             )
                         }
@@ -132,6 +135,6 @@ fun DeckEntriesScreen(
         }
     }
     selected?.let { (tournamentName, entry) ->
-        DecklistSheet(entry, highlightKey = cardKey, tournamentName = tournamentName, onDismiss = { selected = null })
+        DecklistSheet(entry, highlightKey = cardKey, tournamentName = tournamentName, onOpenCard = actions.openCard, onDismiss = { selectedIndex = null })
     }
 }

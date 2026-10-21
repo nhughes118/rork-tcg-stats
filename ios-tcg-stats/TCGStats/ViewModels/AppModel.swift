@@ -148,4 +148,9 @@ final class AppModel {
         }
         HistoryStore.save(history)
     }
+
+    /// Pushes a route onto the active tab's navigation stack.
+    func push(_ route: AppRoute) {
+        if selectedTab == .history { historyPath.append(route) } else { resultsPath.append(route) }
+    }
 }

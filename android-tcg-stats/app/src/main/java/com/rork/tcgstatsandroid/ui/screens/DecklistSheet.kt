@@ -23,6 +23,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Share
@@ -62,7 +63,13 @@ import kotlinx.coroutines.delay
 /** Full decklist with the scanned card highlighted, plus copy/share export. */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun DecklistSheet(entry: PlayerEntry, highlightKey: String, tournamentName: String?, onDismiss: () -> Unit) {
+fun DecklistSheet(
+    entry: PlayerEntry,
+    highlightKey: String,
+    tournamentName: String?,
+    onOpenCard: (cardKey: String) -> Unit,
+    onDismiss: () -> Unit,
+) {
     val context = LocalContext.current
     val haptic = LocalHapticFeedback.current
     val sheetState = rememberModalBottomSheetState()
@@ -132,7 +139,11 @@ fun DecklistSheet(entry: PlayerEntry, highlightKey: String, tournamentName: Stri
                                     Modifier
                                         .fillMaxWidth()
                                         .background(if (highlighted) Palette.Red.copy(alpha = 0.08f) else androidx.compose.ui.graphics.Color.Transparent)
-                                        .padding(horizontal = 16.dp, vertical = 8.dp),
+                                        .pressable {
+                                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                            onOpenCard(card.key)
+                                        }
+                                        .padding(start = 16.dp, end = 10.dp, top = 8.dp, bottom = 8.dp),
                                     verticalAlignment = Alignment.CenterVertically,
                                     horizontalArrangement = Arrangement.spacedBy(12.dp),
                                 ) {
@@ -152,6 +163,12 @@ fun DecklistSheet(entry: PlayerEntry, highlightKey: String, tournamentName: Stri
                                         modifier = Modifier.weight(1f),
                                     )
                                     Text("${card.set} ${card.number}".trim(), fontSize = 12.sp, color = Palette.Muted)
+                                    Icon(
+                                        Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                                        contentDescription = "Open ${card.name} results",
+                                        tint = Palette.Muted.copy(alpha = 0.6f),
+                                        modifier = Modifier.size(18.dp),
+                                    )
                                 }
                             }
                         }

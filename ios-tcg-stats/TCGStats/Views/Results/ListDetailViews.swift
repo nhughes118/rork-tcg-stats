@@ -78,6 +78,9 @@ struct DeckEntriesView: View {
     let deckName: String
     let window: StatsWindow
     @State private var selected: SelectedEntry?
+    /// Decklist to re-present when returning from a card opened inside it.
+    @State private var reopen: SelectedEntry?
+    @State private var pendingCardKey: String?
 
     struct SelectedEntry: Identifiable {
         let entry: PlayerEntry
@@ -109,9 +112,24 @@ struct DeckEntriesView: View {
         .navigationTitle(deckName)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar(.hidden, for: .tabBar)
-        .sheet(item: $selected) { item in
-            DecklistSheet(entry: item.entry, highlightKey: cardKey, tournamentName: item.tournament)
+        .sheet(item: $selected, onDismiss: openPendingCard) { item in
+            DecklistSheet(entry: item.entry, highlightKey: cardKey, tournamentName: item.tournament) { key in
+                reopen = item
+                pendingCardKey = key
+                selected = nil
+            }
         }
+        .onAppear {
+            guard let item = reopen else { return }
+            reopen = nil
+            selected = item
+        }
+    }
+
+    private func openPendingCard() {
+        guard let key = pendingCardKey else { return }
+        pendingCardKey = nil
+        model.push(.card(key))
     }
 }
 
@@ -121,6 +139,8 @@ struct DecklistSheet: View {
     let entry: PlayerEntry
     let highlightKey: String
     let tournamentName: String?
+    /// Opens the tapped card's results; the host re-presents this list on back.
+    var onOpenCard: ((String) -> Void)? = nil
     @State private var didCopy: Bool = false
     @State private var copyTask: Task<Void, Never>?
 
@@ -147,6 +167,9 @@ struct DecklistSheet: View {
                         Section("\(category.title) · \(cards.reduce(0) { $0 + $1.count })") {
                             ForEach(Array(cards.enumerated()), id: \.offset) { _, card in
                                 let isHighlighted = card.key == highlightKey
+                                Button {
+                                    onOpenCard?(card.key)
+                                } label: {
                                 HStack(spacing: 12) {
                                     Text("\(card.count)")
                                         .font(.body.weight(.bold))
@@ -162,7 +185,15 @@ struct DecklistSheet: View {
                                     Text("\(card.set) \(card.number)")
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
+                                    Image(systemName: "chevron.right")
+                                        .font(.footnote.weight(.semibold))
+                                        .foregroundStyle(.tertiary)
                                 }
+                                .contentShape(.rect)
+                                }
+                                .buttonStyle(.plain)
+                                .disabled(onOpenCard == nil)
+                                .accessibilityHint("Opens tournament results for this card")
                                 .listRowBackground(isHighlighted ? Theme.red.opacity(0.08) : Color.white)
                             }
                         }

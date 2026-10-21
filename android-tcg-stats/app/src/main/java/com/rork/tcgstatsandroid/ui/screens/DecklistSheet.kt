@@ -39,6 +39,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -59,6 +60,7 @@ import com.rork.tcgstatsandroid.ui.components.cardSurface
 import com.rork.tcgstatsandroid.ui.components.pressable
 import com.rork.tcgstatsandroid.ui.theme.Palette
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 /** Full decklist with the scanned card highlighted, plus copy/share export. */
 @OptIn(ExperimentalMaterial3Api::class)
@@ -73,6 +75,16 @@ fun DecklistSheet(
     val context = LocalContext.current
     val haptic = LocalHapticFeedback.current
     val sheetState = rememberModalBottomSheetState()
+    val scope = rememberCoroutineScope()
+    var isOpeningCard by remember { mutableStateOf(false) }
+    // Like iOS: slide the sheet down first, then open the card. The host keeps the
+    // selection saved, so the sheet slides back up when the user comes back.
+    val openCard: (String) -> Unit = { key ->
+        if (!isOpeningCard) {
+            isOpeningCard = true
+            scope.launch { sheetState.hide() }.invokeOnCompletion { onOpenCard(key) }
+        }
+    }
     var copyCount by remember { mutableStateOf(0) }
     var didCopy by remember { mutableStateOf(false) }
     LaunchedEffect(copyCount) {
@@ -141,7 +153,7 @@ fun DecklistSheet(
                                         .background(if (highlighted) Palette.Red.copy(alpha = 0.08f) else androidx.compose.ui.graphics.Color.Transparent)
                                         .pressable {
                                             haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                            onOpenCard(card.key)
+                                            openCard(card.key)
                                         }
                                         .padding(start = 16.dp, end = 10.dp, top = 8.dp, bottom = 8.dp),
                                     verticalAlignment = Alignment.CenterVertically,

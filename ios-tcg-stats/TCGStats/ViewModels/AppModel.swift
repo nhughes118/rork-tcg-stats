@@ -2,7 +2,7 @@ import SwiftUI
 import UIKit
 
 enum AppTab: Hashable {
-    case scan, results, events, history
+    case scan, results, events, players, history
 }
 
 /// Navigation destinations shared by the Results and History stacks.

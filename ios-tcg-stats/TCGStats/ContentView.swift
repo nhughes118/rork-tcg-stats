@@ -15,6 +15,9 @@ struct ContentView: View {
             Tab("Events", systemImage: "calendar", value: AppTab.events) {
                 EventsView()
             }
+            Tab("Players", systemImage: "trophy", value: AppTab.players) {
+                PlayersView()
+            }
             Tab("History", systemImage: "clock", value: AppTab.history) {
                 HistoryView()
             }

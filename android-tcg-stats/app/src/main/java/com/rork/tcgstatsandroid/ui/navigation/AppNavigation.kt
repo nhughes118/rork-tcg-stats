@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.BarChart
 import androidx.compose.material.icons.filled.DocumentScanner
+import androidx.compose.material.icons.filled.Event
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material3.Icon
 import androidx.compose.material3.NavigationBar
@@ -43,6 +44,7 @@ import com.rork.tcgstatsandroid.ui.screens.AllDecksScreen
 import com.rork.tcgstatsandroid.ui.screens.AllTournamentsScreen
 import com.rork.tcgstatsandroid.ui.screens.CardResultsScreen
 import com.rork.tcgstatsandroid.ui.screens.DeckEntriesScreen
+import com.rork.tcgstatsandroid.ui.screens.EventsScreen
 import com.rork.tcgstatsandroid.ui.screens.HistoryScreen
 import com.rork.tcgstatsandroid.ui.screens.ResultsTabScreen
 import com.rork.tcgstatsandroid.ui.screens.TournamentScreen
@@ -53,6 +55,7 @@ import kotlin.reflect.KClass
 @Serializable object ScanRoute
 @Serializable object ResultsRoute
 @Serializable object HistoryRoute
+@Serializable object EventsRoute
 @Serializable data class CardRoute(val key: String)
 @Serializable data class TournamentRoute(val id: String, val cardKey: String)
 @Serializable data class AllTournamentsRoute(val cardKey: String, val window: String)
@@ -64,6 +67,7 @@ private data class Tab(val route: Any, val routeClass: KClass<*>, val label: Str
 private val tabs = listOf(
     Tab(ScanRoute, ScanRoute::class, "Scan", Icons.Filled.DocumentScanner),
     Tab(ResultsRoute, ResultsRoute::class, "Results", Icons.Filled.BarChart),
+    Tab(EventsRoute, EventsRoute::class, "Events", Icons.Filled.Event),
     Tab(HistoryRoute, HistoryRoute::class, "History", Icons.Filled.History),
 )
 
@@ -149,6 +153,9 @@ fun AppNavigation(vm: AppViewModel = viewModel()) {
             }
             composable<HistoryRoute>(enterTransition = { fadeIn() }, exitTransition = { fadeOut() }) {
                 HistoryScreen(vm, actions)
+            }
+            composable<EventsRoute>(enterTransition = { fadeIn() }, exitTransition = { fadeOut() }) {
+                EventsScreen()
             }
             composable<CardRoute> { entry ->
                 CardResultsScreen(vm, entry.toRoute<CardRoute>().key, isTabRoot = false, actions = actions)

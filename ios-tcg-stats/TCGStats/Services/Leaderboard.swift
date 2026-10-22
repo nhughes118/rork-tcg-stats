@@ -13,7 +13,7 @@ nonisolated enum Leaderboard {
     static let pageURL = URL(string: "https://www.pokemon.com/us/play-pokemon/leaderboards/tcg-masters/")!
     private static let api = "https://www.pokemon.com/us/play-pokemon/leaderboards/op/api/"
     private static let cacheTTL: TimeInterval = 12 * 3600
-    private static let requestedPerPage = 1000
+    private static let requestedPerPage = 100
     private static let concurrency = 5
     static let userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1"
 
@@ -188,15 +188,15 @@ nonisolated enum Leaderboard {
         var first: Page?
         var chosen: (URLComponents, Int?)?
         var responded = false
-        probe: for (i, template) in templates(division, setup).enumerated() {
-            let sizes: [Int?] = i == 0 && setup.capturedURL != nil ? [requestedPerPage, 100, nil] : [requestedPerPage, 100]
+        probe: for template in templates(division, setup) {
+            // The site's own picker tops out at 100 rows; larger sizes come back empty, so never trust those.
+            let sizes: [Int?] = [requestedPerPage, nil]
             for size in sizes {
                 do {
                     let page = try await fetchPage(session, template, page: 1, perPage: size, attempts: 2)
                     responded = true
                     print("[Leaderboard] probe \(template.string ?? "") per_page=\(size.map(String.init) ?? "page") -> \(page.records.count) records, total \(page.total ?? -1)")
                     if !page.records.isEmpty { first = page; chosen = (template, size); break probe }
-                    break
                 } catch is CancellationError {
                     throw CancellationError()
                 } catch {
@@ -205,8 +205,9 @@ nonisolated enum Leaderboard {
             }
         }
         guard let first, let chosen else {
+            let diag = "page \(setup.capturedURL == nil ? "sent no request" : "request seen"), season \(setup.whenLabel ?? "?")"
             throw LeaderboardError(message: responded
-                ? "The \(division.label) leaderboard is empty right now."
+                ? "The \(division.label) leaderboard came back empty (\(diag))."
                 : "Pokémon's leaderboard didn't respond. It may be limiting requests, so try again in a minute.")
         }
         let (template, size) = chosen

@@ -91,7 +91,7 @@ object Leaderboard {
     private const val API = "https://www.pokemon.com/us/play-pokemon/leaderboards/op/api/"
     const val PAGE_URL = "https://www.pokemon.com/us/play-pokemon/leaderboards/tcg-masters/"
     private const val CACHE_TTL_MS = 12 * 3_600_000L
-    private const val REQUESTED_PER_PAGE = 1000
+    private const val REQUESTED_PER_PAGE = 100
     private const val CONCURRENCY = 5
 
     /** The official page has its own division switcher, so every division links to the same page. */
@@ -232,15 +232,15 @@ object Leaderboard {
             var first: Page? = null
             var chosen: Pair<Template, Int?>? = null
             var responded = false
-            probe@ for ((i, template) in templates(division, setup).withIndex()) {
-                val sizes: List<Int?> = if (i == 0 && setup.capturedUrl != null) listOf(REQUESTED_PER_PAGE, 100, null) else listOf(REQUESTED_PER_PAGE, 100)
+            probe@ for (template in templates(division, setup)) {
+                // The site's own picker tops out at 100 rows; larger sizes come back empty, so never trust those.
+                val sizes: List<Int?> = listOf(REQUESTED_PER_PAGE, null)
                 for (size in sizes) {
                     try {
                         val page = fetchPage(template, 1, size, attempts = 2)
                         responded = true
                         Log.d("Leaderboard", "probe ${template.describe} per_page=${size ?: "page"} -> ${page.records.size} records, total ${page.total}")
                         if (page.records.isNotEmpty()) { first = page; chosen = template to size; break@probe }
-                        break
                     } catch (e: CancellationException) {
                         throw e
                     } catch (e: Exception) {
@@ -250,7 +250,7 @@ object Leaderboard {
             }
             if (first == null || chosen == null) {
                 throw LeaderboardException(
-                    if (responded) "The ${division.label} leaderboard is empty right now."
+                    if (responded) "The ${division.label} leaderboard came back empty (page ${if (setup.capturedUrl == null) "sent no request" else "request seen"}, season ${setup.whenLabel ?: "?"})."
                     else "Pokémon's leaderboard didn't respond. It may be limiting requests, so try again in a minute."
                 )
             }

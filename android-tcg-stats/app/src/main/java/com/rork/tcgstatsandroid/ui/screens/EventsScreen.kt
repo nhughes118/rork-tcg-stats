@@ -51,8 +51,6 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.Switch
-import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
@@ -81,9 +79,11 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.rork.tcgstatsandroid.data.EventGameFilter
 import com.rork.tcgstatsandroid.data.EventKind
 import com.rork.tcgstatsandroid.data.EventLocator
 import com.rork.tcgstatsandroid.data.EventLocatorException
+import com.rork.tcgstatsandroid.data.EventTypeFilter
 import com.rork.tcgstatsandroid.data.GeoPoint
 import com.rork.tcgstatsandroid.data.LocalEvent
 import com.rork.tcgstatsandroid.ui.components.CanvasBackground
@@ -111,7 +111,8 @@ sealed interface EventsPhase {
 data class EventsUiState(
     val query: String = "",
     val range: Int = 25,
-    val tcgOnly: Boolean = true,
+    val game: EventGameFilter = EventGameFilter.All,
+    val type: EventTypeFilter = EventTypeFilter.All,
     val phase: EventsPhase = EventsPhase.Idle,
 )
 
@@ -121,7 +122,8 @@ class EventsViewModel(app: Application) : AndroidViewModel(app) {
         EventsUiState(
             query = prefs.getString(KEY_QUERY, "") ?: "",
             range = prefs.getInt(KEY_RANGE, 25).takeIf { it in EventLocator.distanceOptions } ?: 25,
-            tcgOnly = prefs.getBoolean(KEY_TCG, true),
+            game = EventGameFilter.entries.firstOrNull { it.name == prefs.getString(KEY_GAME, null) } ?: EventGameFilter.All,
+            type = EventTypeFilter.entries.firstOrNull { it.name == prefs.getString(KEY_TYPE, null) } ?: EventTypeFilter.All,
         )
     )
     val state: StateFlow<EventsUiState> = _state
@@ -135,9 +137,14 @@ class EventsViewModel(app: Application) : AndroidViewModel(app) {
         if (_state.value.phase !is EventsPhase.Idle && activity != null) search(activity)
     }
 
-    fun setTcgOnly(value: Boolean) {
-        _state.update { it.copy(tcgOnly = value) }
-        prefs.edit().putBoolean(KEY_TCG, value).apply()
+    fun setGame(value: EventGameFilter) {
+        _state.update { it.copy(game = value) }
+        prefs.edit().putString(KEY_GAME, value.name).apply()
+    }
+
+    fun setType(value: EventTypeFilter) {
+        _state.update { it.copy(type = value) }
+        prefs.edit().putString(KEY_TYPE, value.name).apply()
     }
 
     fun search(activity: Activity) {
@@ -166,7 +173,8 @@ class EventsViewModel(app: Application) : AndroidViewModel(app) {
     private companion object {
         const val KEY_QUERY = "events_query"
         const val KEY_RANGE = "events_range"
-        const val KEY_TCG = "events_tcg_only"
+        const val KEY_GAME = "events_game"
+        const val KEY_TYPE = "events_type"
     }
 }
 
@@ -226,8 +234,8 @@ fun EventsScreen(modifier: Modifier = Modifier, vm: EventsViewModel = viewModel(
     }
 
     val loaded = state.phase as? EventsPhase.Loaded
-    val visible = remember(loaded, state.tcgOnly) {
-        loaded?.events?.filter { !state.tcgOnly || it.isTcg }.orEmpty()
+    val visible = remember(loaded, state.game, state.type) {
+        loaded?.events?.filter { it.matches(state.game, state.type) }.orEmpty()
     }
 
     CanvasBackground(modifier) {
@@ -239,7 +247,7 @@ fun EventsScreen(modifier: Modifier = Modifier, vm: EventsViewModel = viewModel(
             item(key = "title") {
                 Column(Modifier.padding(bottom = 4.dp)) {
                     Text("Events", fontSize = 34.sp, fontWeight = FontWeight.Bold, color = Palette.Ink)
-                    Text("Pokémon TCG events near you", fontSize = 15.sp, color = Palette.Muted)
+                    Text("Pokémon events near you", fontSize = 15.sp, color = Palette.Muted)
                 }
             }
             item(key = "search") {
@@ -248,8 +256,10 @@ fun EventsScreen(modifier: Modifier = Modifier, vm: EventsViewModel = viewModel(
                     onQuery = vm::setQuery,
                     range = state.range,
                     onRange = { vm.setRange(it, activity) },
-                    tcgOnly = state.tcgOnly,
-                    onTcgOnly = vm::setTcgOnly,
+                    game = state.game,
+                    onGame = { haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove); vm.setGame(it) },
+                    type = state.type,
+                    onType = { haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove); vm.setType(it) },
                     loading = state.phase is EventsPhase.Loading,
                     onSubmit = submit,
                 )
@@ -274,7 +284,9 @@ fun EventsScreen(modifier: Modifier = Modifier, vm: EventsViewModel = viewModel(
                                 icon = Icons.Filled.EventBusy,
                                 title = "No events found",
                                 message = "Nothing within ${state.range} mi of ${phase.place.label}" +
-                                    (if (state.tcgOnly && phase.events.isNotEmpty()) " for the TCG. Turn off TCG only to see other events." else ". Try a wider distance."),
+                                    (if ((state.game != EventGameFilter.All || state.type != EventTypeFilter.All) && phase.events.isNotEmpty()) {
+                                        " matching ${filterDescription(state.game, state.type)}. ${phase.events.size} other event${if (phase.events.size == 1) "" else "s"} hidden by filters."
+                                    } else ". Try a wider distance."),
                                 primary = null,
                                 pokemonUrl = pokemonUrl,
                             )
@@ -351,8 +363,10 @@ private fun SearchCard(
     onQuery: (String) -> Unit,
     range: Int,
     onRange: (Int) -> Unit,
-    tcgOnly: Boolean,
-    onTcgOnly: (Boolean) -> Unit,
+    game: EventGameFilter,
+    onGame: (EventGameFilter) -> Unit,
+    type: EventTypeFilter,
+    onType: (EventTypeFilter) -> Unit,
     loading: Boolean,
     onSubmit: () -> Unit,
 ) {
@@ -411,19 +425,50 @@ private fun SearchCard(
             onSelect = onRange,
             modifier = Modifier.fillMaxWidth(),
         )
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Column(Modifier.weight(1f)) {
-                Text("TCG only", fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = Palette.Ink)
-                Text("Hide video game and Pokémon GO events", fontSize = 12.sp, color = Palette.Muted)
-            }
-            Switch(
-                checked = tcgOnly,
-                onCheckedChange = onTcgOnly,
-                colors = SwitchDefaults.colors(checkedTrackColor = Palette.Blue, checkedThumbColor = Color.White),
+        FilterRow("Game") {
+            SegmentedPicker(
+                options = EventGameFilter.entries,
+                selected = game,
+                label = { it.label },
+                onSelect = onGame,
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
+        FilterRow("Type") {
+            SegmentedPicker(
+                options = EventTypeFilter.entries,
+                selected = type,
+                label = { it.label },
+                onSelect = onType,
+                modifier = Modifier.fillMaxWidth(),
             )
         }
     }
 }
+
+@Composable
+private fun FilterRow(title: String, control: @Composable () -> Unit) {
+    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+        Text(
+            title.uppercase(Locale.US),
+            fontSize = 12.sp,
+            fontWeight = FontWeight.Bold,
+            letterSpacing = 0.6.sp,
+            color = Palette.Muted,
+            modifier = Modifier.width(44.dp),
+        )
+        Box(Modifier.weight(1f)) { control() }
+    }
+}
+
+private fun filterDescription(game: EventGameFilter, type: EventTypeFilter): String = listOfNotNull(
+    game.game?.label,
+    when (type) {
+        EventTypeFilter.All -> null
+        EventTypeFilter.Cp -> "Championship Points (Challenges & Cups)"
+        EventTypeFilter.Other -> "non-CP"
+    },
+).joinToString(" · ")
 
 @Composable
 private fun IdleState() {
@@ -539,7 +584,8 @@ private fun EventRow(event: LocalEvent, modifier: Modifier = Modifier, onClick: 
         Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 KindBadge(event)
-                event.distanceMiles?.let { Text(milesLabel(it), fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = Palette.Muted) }
+                val meta = listOfNotNull(event.gameLabel, event.distanceMiles?.let(::milesLabel)).joinToString(" · ")
+                if (meta.isNotEmpty()) Text(meta, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = Palette.Muted, maxLines = 1)
             }
             Text(event.name, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = Palette.Ink, maxLines = 2, overflow = TextOverflow.Ellipsis)
             val sub = listOfNotNull(event.timeLabel(), event.venue).joinToString(" · ")

@@ -71,5 +71,6 @@ dependencies {
     implementation(libs.camerax.lifecycle)
     implementation(libs.camerax.view)
     implementation(libs.mlkit.text.recognition)
+    implementation(libs.androidx.webkit)
     debugImplementation(libs.androidx.ui.tooling)
 }

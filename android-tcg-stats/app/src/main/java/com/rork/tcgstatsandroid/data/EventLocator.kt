@@ -13,6 +13,8 @@ import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import androidx.webkit.WebViewCompat
+import androidx.webkit.WebViewFeature
 import android.widget.FrameLayout
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
@@ -47,6 +49,14 @@ enum class EventKind(val label: String) {
     Other("Event"),
 }
 
+enum class EventGame(val label: String) { Tcg("TCG"), Vgc("VGC"), Go("GO") }
+
+enum class EventGameFilter(val label: String, val game: EventGame?) {
+    All("All", null), Tcg("TCG", EventGame.Tcg), Vgc("VGC", EventGame.Vgc), Go("GO", EventGame.Go)
+}
+
+enum class EventTypeFilter(val label: String) { All("All"), Cp("CP events"), Other("Other") }
+
 data class GeoPoint(val latitude: Double, val longitude: Double, val label: String)
 
 data class LocalEvent(
@@ -66,17 +76,49 @@ data class LocalEvent(
     val cost: String?,
     val link: String?,
 ) {
-    /** Hides only events clearly for other games (VG, GO, UNITE); unknown product formats stay visible. */
-    val isTcg: Boolean
-        get() {
-            if (name.contains("tcg", true) || products.isEmpty()) return true
-            if (products.any { it.contains("tcg", true) || it.contains("trading card", true) }) return true
-            val otherGame = setOf("video game", "videogame", "vg", "go", "pokémon go", "pokemon go", "unite")
-            return !products.all { p ->
-                val t = p.trim().lowercase(Locale.US)
-                t in otherGame || t.contains("video game") || t.endsWith(" go") || t.contains("unite")
-            }
+    /**
+     * Games this event is for, from its listed products and name. Unknown formats count as TCG;
+     * UNITE-only events have no game and only show under "All".
+     */
+    val games: Set<EventGame> by lazy {
+        val result = mutableSetOf<EventGame>()
+        fun scan(raw: String, fromName: Boolean) {
+            val t = raw.lowercase(Locale.US)
+            if (t.contains("tcg") || t.contains("trading card")) result += EventGame.Tcg
+            if (t.contains("video game") || t.contains("videogame") || t.contains("vgc") || VG.containsMatchIn(t)) result += EventGame.Vgc
+            if (t.contains("pokémon go") || t.contains("pokemon go") || (!fromName && GO.containsMatchIn(t))) result += EventGame.Go
         }
+        products.forEach { scan(it, false) }
+        scan(name, true)
+        if (result.isEmpty()) {
+            val unite = products.any { it.contains("unite", true) } || name.contains("unite", true)
+            if (!unite) result += EventGame.Tcg
+        }
+        result
+    }
+
+    /** Short game label for rows, e.g. "TCG" or "TCG/VGC". */
+    val gameLabel: String?
+        get() = if (games.isEmpty()) {
+            if (products.any { it.contains("unite", true) }) "UNITE" else null
+        } else EventGame.entries.filter { it in games }.joinToString("/") { it.label }
+
+    /** Championship Points events (League Challenges and League Cups). */
+    val awardsCp: Boolean get() = kind == EventKind.LeagueCup || kind == EventKind.LeagueChallenge
+
+    fun matches(game: EventGameFilter, type: EventTypeFilter): Boolean {
+        game.game?.let { if (it !in games) return false }
+        return when (type) {
+            EventTypeFilter.All -> true
+            EventTypeFilter.Cp -> awardsCp
+            EventTypeFilter.Other -> !awardsCp
+        }
+    }
+
+    private companion object {
+        val VG = Regex("""\bvg\b""")
+        val GO = Regex("""\bgo\b""")
+    }
 
     private fun zone(): TimeZone = timeZone?.let { TimeZone.getTimeZone(it) } ?: TimeZone.getDefault()
 
@@ -157,8 +199,8 @@ object EventLocator {
 
     // The Event Locator only runs its event search on load when its stored client variables say a search is in
     // progress (AreEventsBeingSearched) in events mode (IsShowEvents). A fresh WebView has neither, so the page
-    // would just show its landing state. This hook forces both on, captures the data responses, and as a last
-    // resort writes the variables and reloads once.
+    // would just show its landing state. This hook forces both on and captures the data responses; __tcgPrime
+    // writes the variables to storage so a reload starts in search mode.
     private const val HOOK_JS = """
 (function(){
   if (window.__tcgHooked) return; window.__tcgHooked = true;
@@ -167,11 +209,10 @@ object EventLocator {
   function forced(k){ k = String(k); var i = k.indexOf(MARK); if (i < 0) return false; return FORCE.indexOf(k.substring(i + MARK.length)) >= 0; }
   function truthy(v){ if (v === 'True' || v === 'False') return 'True'; if (v === '1' || v === '0') return '1'; return 'true'; }
   try { SP.getItem = function(k){ var v = og.apply(this, arguments); try { if (forced(k)) return truthy(v); } catch(e){} return v; }; } catch(e){}
-  function prime(){ try { var s = window.localStorage, pre = null; for (var i = 0; i < s.length; i++){ var k = s.key(i), j = k.indexOf(MARK); if (j >= 0 && k.indexOf('EventLocator') >= 0){ pre = k.substring(0, j + MARK.length); break; } } if (!pre) return false; var changed = false; FORCE.forEach(function(n){ var v = og.call(s, pre + n); if (v !== truthy(v)) { osi.call(s, pre + n, truthy(v)); changed = true; } }); return changed; } catch(e){ return false; } }
+  function prime(){ try { var s = window.localStorage, pre = null; for (var i = 0; i < s.length; i++){ var k = s.key(i), j = k.indexOf(MARK); if (j >= 0 && k.indexOf('EventLocator') >= 0){ pre = k.substring(0, j + MARK.length); break; } } if (!pre) return false; FORCE.forEach(function(n){ var v = og.call(s, pre + n); if (v !== truthy(v)) osi.call(s, pre + n, truthy(v)); }); return true; } catch(e){ return false; } }
+  window.__tcgPrime = prime;
   prime();
-  function arm(){ setTimeout(function(){ try { if (window.__tcgSawEvents) return; var ss = window.sessionStorage; if (og.call(ss, '__tcgReloaded')) return; if (prime()) { osi.call(ss, '__tcgReloaded', '1'); location.reload(); } } catch(e){} }, 7000); }
-  if (document.readyState === 'complete') arm(); else window.addEventListener('load', arm);
-  function send(u, b){ try { if (u && String(u).indexOf('screenservices') >= 0 && window.TCGEvents) { if (String(u).indexOf('GetEventList') >= 0) window.__tcgSawEvents = true; window.TCGEvents.post(JSON.stringify({url:String(u), body:String(b)})); } } catch(e){} }
+  function send(u, b){ try { if (u && String(u).indexOf('screenservices') >= 0 && window.TCGEvents) { window.TCGEvents.post(JSON.stringify({url:String(u), body:String(b)})); } } catch(e){} }
   var oo = XMLHttpRequest.prototype.open, os = XMLHttpRequest.prototype.send;
   XMLHttpRequest.prototype.open = function(m, u){ this.__tcgUrl = u; return oo.apply(this, arguments); };
   XMLHttpRequest.prototype.send = function(){ var x = this; x.addEventListener('load', function(){ try { send(x.responseURL || x.__tcgUrl, x.responseText); } catch(e){} }); return os.apply(this, arguments); };
@@ -181,15 +222,22 @@ object EventLocator {
 
     data class Captured(val url: String, val body: String)
 
+    // On a first visit the site's bot check sets its cookies while the page loads, so the page's own data requests
+    // can come back empty. If no event list arrives, the page is reloaded (cookies and search state are in place
+    // by then), which is what a second manual search used to do.
+    private const val MAX_RELOADS = 2
+    private const val RELOAD_AFTER_MS = 9_000L
+
     /** Loads the official Event Locator in an invisible WebView and captures its data responses. */
     @SuppressLint("SetJavaScriptEnabled")
-    suspend fun fetchResponses(activity: Activity, url: String, timeoutMs: Long = 35_000): List<Captured> = withContext(Dispatchers.Main) {
+    suspend fun fetchResponses(activity: Activity, url: String, timeoutMs: Long = 50_000): List<Captured> = withContext(Dispatchers.Main) {
         val captured = mutableListOf<Captured>()
         val finished = CompletableDeferred<Unit>()
         val handler = Handler(Looper.getMainLooper())
         val finish = Runnable { finished.complete(Unit) }
         var sawEventList = false
         var sawLocations = false
+        var reloads = 0
 
         val web = WebView(activity)
         web.settings.javaScriptEnabled = true
@@ -197,6 +245,30 @@ object EventLocator {
         web.settings.loadsImagesAutomatically = false
         CookieManager.getInstance().setAcceptCookie(true)
         CookieManager.getInstance().setAcceptThirdPartyCookies(web, true)
+        val documentStart = WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)
+        if (documentStart) {
+            runCatching { WebViewCompat.addDocumentStartJavaScript(web, HOOK_JS, setOf("https://events.pokemon.com")) }
+        }
+
+        lateinit var watchdog: Runnable
+        watchdog = Runnable {
+            if (finished.isCompleted || sawEventList) return@Runnable
+            if (reloads >= MAX_RELOADS) {
+                // Out of retries: settle for whatever arrived (e.g. stores only).
+                if (sawLocations) { handler.removeCallbacks(finish); handler.postDelayed(finish, 3_000) }
+                return@Runnable
+            }
+            reloads++
+            Log.d("Events", "no event list yet, reloading ($reloads/$MAX_RELOADS)")
+            handler.removeCallbacks(finish)
+            sawLocations = false
+            web.evaluateJavascript("window.__tcgPrime ? window.__tcgPrime() : false") {
+                if (finished.isCompleted) return@evaluateJavascript
+                web.loadUrl(url)
+                handler.postDelayed(watchdog, RELOAD_AFTER_MS)
+            }
+        }
+
         web.addJavascriptInterface(object {
             @JavascriptInterface
             fun post(message: String) {
@@ -205,20 +277,26 @@ object EventLocator {
                     val u = obj.str("url") ?: return@post
                     val b = obj.str("body") ?: return@post
                     captured += Captured(u, b)
-                    if (u.contains("GetEventList", true)) sawEventList = true
-                    if (u.contains("GetLocations", true)) sawLocations = true
                     Log.d("Events", "captured ${u.substringAfterLast('/')} (${b.length} bytes)")
-                    // Event lists arrive in batches; a store-only response may still be followed by a reload into events mode.
-                    if (sawEventList || sawLocations) {
+                    if (u.contains("GetEventList", true)) {
+                        sawEventList = true
+                        handler.removeCallbacks(watchdog)
+                        // Event lists arrive in batches; finish once they go quiet.
                         handler.removeCallbacks(finish)
-                        handler.postDelayed(finish, if (sawEventList) 3_000 else 10_000)
+                        handler.postDelayed(finish, 3_000)
+                    } else if (u.contains("GetLocations", true)) {
+                        sawLocations = true
+                        if (reloads >= MAX_RELOADS && !sawEventList) {
+                            handler.removeCallbacks(finish)
+                            handler.postDelayed(finish, 10_000)
+                        }
                     }
                 }
             }
         }, "TCGEvents")
         web.webViewClient = object : WebViewClient() {
             override fun onPageStarted(view: WebView, url: String?, favicon: android.graphics.Bitmap?) {
-                view.evaluateJavascript(HOOK_JS, null)
+                if (!documentStart) view.evaluateJavascript(HOOK_JS, null)
             }
 
             override fun onPageFinished(view: WebView, url: String?) {
@@ -227,7 +305,7 @@ object EventLocator {
         }
         web.webChromeClient = object : WebChromeClient() {
             override fun onProgressChanged(view: WebView, newProgress: Int) {
-                view.evaluateJavascript(HOOK_JS, null)
+                if (!documentStart) view.evaluateJavascript(HOOK_JS, null)
             }
         }
         web.alpha = 0.01f
@@ -235,9 +313,12 @@ object EventLocator {
         root.addView(web, FrameLayout.LayoutParams(1, 1))
         try {
             web.loadUrl(url)
+            handler.postDelayed(watchdog, RELOAD_AFTER_MS)
             withTimeoutOrNull(timeoutMs) { finished.await() }
         } finally {
             handler.removeCallbacks(finish)
+            handler.removeCallbacks(watchdog)
+            finished.complete(Unit)
             web.stopLoading()
             root.removeView(web)
             web.destroy()

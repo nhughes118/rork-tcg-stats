@@ -46,7 +46,8 @@ final class EventsModel {
 struct EventsView: View {
     @AppStorage("events_query") private var query: String = ""
     @AppStorage("events_range") private var range: Int = 25
-    @AppStorage("events_tcg_only") private var tcgOnly: Bool = true
+    @AppStorage("events_game") private var gameFilter: EventGameFilter = .all
+    @AppStorage("events_type") private var typeFilter: EventTypeFilter = .all
     @State private var model = EventsModel()
     @State private var selected: LocalEvent?
     @FocusState private var fieldFocused: Bool
@@ -54,7 +55,7 @@ struct EventsView: View {
 
     private var visible: [LocalEvent] {
         guard case .loaded(_, let events) = model.phase else { return [] }
-        return tcgOnly ? events.filter(\.isTCG) : events
+        return events.filter { $0.matches(game: gameFilter, type: typeFilter) }
     }
 
     private var groups: [(key: String, events: [LocalEvent])] {
@@ -71,7 +72,7 @@ struct EventsView: View {
         NavigationStack {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 10) {
-                    Text("Pokémon TCG events near you")
+                    Text("Pokémon events near you")
                         .font(.subheadline)
                         .foregroundStyle(Theme.muted)
                         .padding(.horizontal, 4)
@@ -158,16 +159,47 @@ struct EventsView: View {
                 model.search(query, range: range)
             }
 
-            Toggle(isOn: $tcgOnly.animation(.snappy)) {
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("TCG only").font(.subheadline.weight(.semibold)).foregroundStyle(Theme.ink)
-                    Text("Hide video game and Pokémon GO events").font(.caption).foregroundStyle(Theme.muted)
+            filterRow("Game") {
+                Picker("Game", selection: $gameFilter.animation(.snappy)) {
+                    ForEach(EventGameFilter.allCases, id: \.self) { Text($0.rawValue).tag($0) }
                 }
+                .pickerStyle(.segmented)
             }
-            .tint(Theme.blue)
+
+            filterRow("Type") {
+                Picker("Type", selection: $typeFilter.animation(.snappy)) {
+                    ForEach(EventTypeFilter.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+                }
+                .pickerStyle(.segmented)
+            }
+            .sensoryFeedback(.selection, trigger: typeFilter)
+            .sensoryFeedback(.selection, trigger: gameFilter)
         }
         .padding(14)
         .cardSurface()
+    }
+
+    private func filterRow<C: View>(_ title: String, @ViewBuilder control: () -> C) -> some View {
+        HStack(spacing: 10) {
+            Text(title)
+                .font(.caption.weight(.bold))
+                .tracking(0.6)
+                .textCase(.uppercase)
+                .foregroundStyle(Theme.muted)
+                .frame(width: 42, alignment: .leading)
+            control()
+        }
+    }
+
+    private var filterDescription: String {
+        var parts: [String] = []
+        if let g = gameFilter.game { parts.append(g.rawValue) }
+        switch typeFilter {
+        case .all: break
+        case .cp: parts.append("Championship Points (Challenges & Cups)")
+        case .other: parts.append("non-CP")
+        }
+        return parts.joined(separator: " · ")
     }
 
     // MARK: Content
@@ -196,8 +228,9 @@ struct EventsView: View {
                          retry: { model.search(query, range: range) }, url: point.map(pokemonURL))
         case .loaded(let point, let events):
             if visible.isEmpty {
-                let extra = tcgOnly && !events.isEmpty
-                    ? " for the TCG. Turn off TCG only to see other events."
+                let filtered = gameFilter != .all || typeFilter != .all
+                let extra = filtered && !events.isEmpty
+                    ? " matching \(filterDescription). \(events.count) other event\(events.count == 1 ? "" : "s") hidden by filters."
                     : ". Try a wider distance."
                 messageState(icon: "calendar.badge.exclamationmark", title: "No events found",
                              message: "Nothing within \(range) mi of \(point.label)\(extra)",
@@ -329,8 +362,9 @@ private struct EventRow: View {
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
                     KindBadge(event: event)
-                    if let d = event.distanceMiles {
-                        Text(LocalEvent.milesLabel(d)).font(.caption.weight(.semibold)).foregroundStyle(Theme.muted)
+                    let meta = [event.gameLabel, event.distanceMiles.map(LocalEvent.milesLabel)].compactMap { $0 }
+                    if !meta.isEmpty {
+                        Text(meta.joined(separator: " · ")).font(.caption.weight(.semibold)).foregroundStyle(Theme.muted)
                     }
                 }
                 Text(event.name)

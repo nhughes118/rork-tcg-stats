@@ -28,6 +28,29 @@ extension EventKind {
     var textColor: Color { self == .prerelease ? Theme.ink : color }
 }
 
+nonisolated enum EventGame: String, CaseIterable, Sendable {
+    case tcg = "TCG"
+    case vgc = "VGC"
+    case go = "GO"
+}
+
+nonisolated enum EventGameFilter: String, CaseIterable, Sendable {
+    case all = "All", tcg = "TCG", vgc = "VGC", go = "GO"
+
+    var game: EventGame? {
+        switch self {
+        case .all: nil
+        case .tcg: .tcg
+        case .vgc: .vgc
+        case .go: .go
+        }
+    }
+}
+
+nonisolated enum EventTypeFilter: String, CaseIterable, Sendable {
+    case all = "All", cp = "CP events", other = "Other"
+}
+
 nonisolated struct GeoPoint: Hashable, Sendable {
     let latitude: Double
     let longitude: Double
@@ -51,16 +74,44 @@ nonisolated struct LocalEvent: Identifiable, Hashable, Sendable {
     let cost: String?
     let link: String?
 
-    /// Hides only events that are clearly for other games (VG, GO, UNITE); unknown product formats stay visible.
-    var isTCG: Bool {
-        if name.localizedCaseInsensitiveContains("tcg") || products.isEmpty { return true }
-        if products.contains(where: { $0.localizedCaseInsensitiveContains("tcg") || $0.localizedCaseInsensitiveContains("trading card") }) {
-            return true
+    /// Games this event is for, from its listed products and name. Unknown formats count as TCG;
+    /// UNITE-only events have no game and only show under "All".
+    var games: Set<EventGame> {
+        var result = Set<EventGame>()
+        func scan(_ raw: String, fromName: Bool) {
+            let t = raw.lowercased()
+            if t.contains("tcg") || t.contains("trading card") { result.insert(.tcg) }
+            if t.contains("video game") || t.contains("videogame") || t.contains("vgc")
+                || t.range(of: #"\bvg\b"#, options: .regularExpression) != nil { result.insert(.vgc) }
+            if t.contains("pokémon go") || t.contains("pokemon go")
+                || (!fromName && t.range(of: #"\bgo\b"#, options: .regularExpression) != nil) { result.insert(.go) }
         }
-        let otherGame = ["video game", "videogame", "vg", "go", "pokémon go", "pokemon go", "unite", "pokémon unite", "pokemon unite"]
-        return !products.allSatisfy { p in
-            let t = p.lowercased().trimmingCharacters(in: .whitespaces)
-            return otherGame.contains(t) || t.contains("video game") || t.hasSuffix(" go") || t.contains("unite")
+        products.forEach { scan($0, fromName: false) }
+        scan(name, fromName: true)
+        if result.isEmpty {
+            let unite = products.contains { $0.localizedCaseInsensitiveContains("unite") }
+                || name.localizedCaseInsensitiveContains("unite")
+            if !unite { result.insert(.tcg) }
+        }
+        return result
+    }
+
+    /// Short game label for rows, e.g. "TCG" or "TCG/VGC".
+    var gameLabel: String? {
+        let g = games
+        guard !g.isEmpty else { return products.contains { $0.localizedCaseInsensitiveContains("unite") } ? "UNITE" : nil }
+        return EventGame.allCases.filter(g.contains).map(\.rawValue).joined(separator: "/")
+    }
+
+    /// Championship Points events (League Challenges and League Cups).
+    var awardsCP: Bool { kind == .leagueCup || kind == .leagueChallenge }
+
+    func matches(game: EventGameFilter, type: EventTypeFilter) -> Bool {
+        if let g = game.game, !games.contains(g) { return false }
+        switch type {
+        case .all: return true
+        case .cp: return awardsCP
+        case .other: return !awardsCP
         }
     }
 

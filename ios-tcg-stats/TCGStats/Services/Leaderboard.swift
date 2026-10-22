@@ -17,8 +17,31 @@ nonisolated enum Leaderboard {
     private static let concurrency = 5
     static let userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1"
 
-    static func apiURL(_ division: Division, page: Int, perPage: Int) -> URL {
-        URL(string: "\(api)\(division.rawValue)/?per_page=\(perPage)&page=\(page)&include=metadata&format=json")!
+    /// Without `leaderboard_type=championship` the API answers with the (empty) Play! Points board, and
+    /// `leaderboard_when` selects the season.
+    static func apiURL(_ division: Division, season: String?, page: Int, perPage: Int) -> URL {
+        var s = "\(api)\(division.rawValue)/?leaderboard_type=championship"
+        if let season { s += "&leaderboard_when=\(season)" }
+        s += "&leaderboard_who=&per_page=\(perPage)&page=\(page)&include=metadata&format=json"
+        return URL(string: s)!
+    }
+
+    /// Known season ids (from the site's picker), used when the page can't be read.
+    private static let fallbackSeasons = [LeaderboardSeason(id: "60", label: "2026")]
+
+    /// Overall-season entries (label is just a year), newest first. Event-only entries like "NAIC 2026" are skipped.
+    static func parseSeasons(_ html: String) -> [LeaderboardSeason] {
+        let pattern = #"<option[^>]*class="[^"]*championship[^"]*"[^>]*value="(\d+)"[^>]*>\s*([^<]*?)\s*<"#
+        guard let re = try? NSRegularExpression(pattern: pattern) else { return [] }
+        let ns = html as NSString
+        var out: [(LeaderboardSeason, Int)] = []
+        for m in re.matches(in: html, range: NSRange(location: 0, length: ns.length)) {
+            let id = ns.substring(with: m.range(at: 1))
+            let label = ns.substring(with: m.range(at: 2)).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard label.count == 4, let year = Int(label) else { continue }
+            if !out.contains(where: { $0.0.id == id }) { out.append((LeaderboardSeason(id: id, label: label), year)) }
+        }
+        return out.sorted { $0.1 > $1.1 }.map(\.0)
     }
 
     // MARK: Cache
@@ -26,7 +49,7 @@ nonisolated enum Leaderboard {
     private static func cacheURL(_ division: Division) -> URL {
         let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("leaderboard", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent("\(division.rawValue)-v1.json")
+        return dir.appendingPathComponent("\(division.rawValue)-v2.json")
     }
 
     static func cached(_ division: Division) async -> LeaderboardIndex? {
@@ -73,14 +96,22 @@ nonisolated enum Leaderboard {
         private var opening: Task<LeaderboardWebFetcher, Never>?
 
         func text(_ url: URL) async -> String {
+            await get(url, accept: "application/json, text/plain, */*") { $0.drop(while: \.isWhitespace).first == "{" }
+        }
+
+        func html(_ url: URL) async -> String {
+            await get(url, accept: "text/html,application/xhtml+xml") { $0.contains("leaderboardWhenFilter") }
+        }
+
+        private func get(_ url: URL, accept: String, valid: (String) -> Bool) async -> String {
             if fetcher == nil && opening == nil {
                 var request = URLRequest(url: url, timeoutInterval: 30)
-                request.setValue("application/json, text/plain, */*", forHTTPHeaderField: "Accept")
+                request.setValue(accept, forHTTPHeaderField: "Accept")
                 request.setValue(Leaderboard.userAgent, forHTTPHeaderField: "User-Agent")
                 if let (data, response) = try? await URLSession.shared.data(for: request),
                    (response as? HTTPURLResponse)?.statusCode == 200,
                    let body = String(data: data, encoding: .utf8),
-                   body.drop(while: \.isWhitespace).first == "{" {
+                   valid(body) {
                     return body
                 }
                 print("[Leaderboard] native fetch blocked, switching to web view")
@@ -110,12 +141,12 @@ nonisolated enum Leaderboard {
         }
     }
 
-    private static func fetchPage(_ session: FetchSession, _ division: Division, page: Int) async throws -> Page {
+    private static func fetchPage(_ session: FetchSession, _ division: Division, season: String?, page: Int) async throws -> Page {
         var attempt = 0
         while true {
             try Task.checkCancellation()
-            let text = await session.text(apiURL(division, page: page, perPage: requestedPerPage))
-            if text.drop(while: \.isWhitespace).first == "{", let parsed = parse(text) {
+            let text = await session.text(apiURL(division, season: season, page: page, perPage: requestedPerPage))
+            if text.drop(while: \.isWhitespace).first == "{", let parsed = parse(text, page: page) {
                 return parsed
             }
             attempt += 1
@@ -145,17 +176,34 @@ nonisolated enum Leaderboard {
         _ division: Division,
         onProgress: @escaping @Sendable ([LeaderboardPlayer], Int) async -> Void
     ) async throws -> LeaderboardIndex {
-        let first: Page
-        do {
-            first = try await fetchPage(session, division, page: 1)
-        } catch is CancellationError {
-            throw CancellationError()
-        } catch {
-            throw LeaderboardError(message: "Pokémon's leaderboard didn't respond. It may be limiting requests, so try again in a minute.")
+        // The season ids come from the page's own picker; try the newest season first, then older ones.
+        var seasons = parseSeasons(await session.html(pageURL))
+        if seasons.isEmpty { seasons = fallbackSeasons }
+        print("[Leaderboard] seasons: \(seasons.map { "\($0.label)=\($0.id)" }.joined(separator: ", "))")
+        var candidates: [LeaderboardSeason?] = Array(seasons.prefix(2))
+        candidates.append(nil)
+
+        var first: Page?
+        var season: LeaderboardSeason?
+        var responded = false
+        for candidate in candidates {
+            do {
+                let page = try await fetchPage(session, division, season: candidate?.id, page: 1)
+                responded = true
+                print("[Leaderboard] \(division.rawValue) season \(candidate?.id ?? "default"): \(page.records.count) records")
+                if !page.records.isEmpty { first = page; season = candidate; break }
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                continue
+            }
         }
-        guard !first.records.isEmpty else {
-            throw LeaderboardError(message: "The \(division.label) leaderboard is empty right now.")
+        guard let first else {
+            throw LeaderboardError(message: responded
+                ? "The \(division.label) leaderboard is empty right now."
+                : "Pokémon's leaderboard didn't respond. It may be limiting requests, so try again in a minute.")
         }
+        let seasonID = season?.id
         let perPage = first.records.count
         let total = first.total ?? perPage
         let pageCount = (first.pageCount ?? 0) > 0 ? first.pageCount! : Int((Double(total) / Double(perPage)).rounded(.up))
@@ -168,7 +216,7 @@ nonisolated enum Leaderboard {
             try await withThrowingTaskGroup(of: [LeaderboardPlayer]?.self) { group in
                 var pages = Array(2...pageCount).makeIterator()
                 let task: @Sendable (Int) async throws -> [LeaderboardPlayer]? = { page in
-                    do { return try await fetchPage(session, division, page: page).records }
+                    do { return try await fetchPage(session, division, season: seasonID, page: page).records }
                     catch is CancellationError { throw CancellationError() }
                     catch { return nil }
                 }
@@ -188,23 +236,24 @@ nonisolated enum Leaderboard {
 
         let players = await collector.all().sorted { $0.rank < $1.rank }
         let failed = await collector.failedPages
-        let index = LeaderboardIndex(division: division.rawValue, fetchedAt: Date(), total: total, complete: failed == 0, players: players)
+        let index = LeaderboardIndex(division: division.rawValue, fetchedAt: Date(), total: total, complete: failed == 0, players: players, season: season?.label)
         print("[Leaderboard] \(division.rawValue): indexed \(players.count)/\(total) (failed pages \(failed))")
         save(index, division)
         return index
     }
 
-    private static func parse(_ text: String) -> Page? {
+    private static func parse(_ text: String, page: Int) -> Page? {
         guard let data = text.data(using: .utf8),
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
         let board = root["leaderboard"] as? [String: Any]
         let meta = (root["_metadata"] as? [String: Any]) ?? (board?["_metadata"] as? [String: Any])
         let boardMeta = board?["_metadata"] as? [String: Any]
         let records = (board?["records"] as? [[String: Any]]) ?? (root["records"] as? [[String: Any]]) ?? []
-        let players: [LeaderboardPlayer] = records.compactMap { o in
-            guard let rank = int(o["rank"]), let name = str(o["screen_name"]) ?? str(o["name"]) else { return nil }
+        let perPage = int(meta?["per_page"]) ?? int(boardMeta?["per_page"]) ?? records.count
+        let players: [LeaderboardPlayer] = records.enumerated().compactMap { i, o in
+            guard let name = (str(o["screen_name"]) ?? str(o["name"]))?.replacingOccurrences(of: "\\'", with: "'") else { return nil }
             return LeaderboardPlayer(
-                rank: rank,
+                rank: int(o["rank"]) ?? ((page - 1) * perPage + i + 1),
                 name: name,
                 points: int(o["score"]) ?? 0,
                 country: str(o["country_name"]),

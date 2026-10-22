@@ -115,7 +115,7 @@ import kotlin.math.abs
 sealed interface LeaderboardSync {
     data object Idle : LeaderboardSync
     data class Loading(val loaded: Int, val total: Int) : LeaderboardSync
-    data class Ready(val fetchedAt: Long, val complete: Boolean) : LeaderboardSync
+    data class Ready(val fetchedAt: Long, val complete: Boolean, val season: String? = null) : LeaderboardSync
     data class Failed(val message: String) : LeaderboardSync
 }
 
@@ -152,7 +152,7 @@ class PlayersViewModel(app: Application) : AndroidViewModel(app) {
         if (_state.value.division != division) return
         cacheIndex = cached
         applyPlayers(cached.players, cached.total)
-        _state.update { it.copy(sync = LeaderboardSync.Ready(cached.fetchedAt, cached.complete)) }
+        _state.update { it.copy(sync = LeaderboardSync.Ready(cached.fetchedAt, cached.complete, cached.season)) }
     }
 
     private suspend fun applyPlayers(players: List<LeaderboardPlayer>, total: Int) {
@@ -188,7 +188,7 @@ class PlayersViewModel(app: Application) : AndroidViewModel(app) {
             if (cached != null && cached.division == division.slug && Leaderboard.isFresh(cached)) {
                 if (_state.value.players.isEmpty()) {
                     applyPlayers(cached.players, cached.total)
-                    _state.update { it.copy(sync = LeaderboardSync.Ready(cached.fetchedAt, cached.complete)) }
+                    _state.update { it.copy(sync = LeaderboardSync.Ready(cached.fetchedAt, cached.complete, cached.season)) }
                 }
                 return@launch
             }
@@ -216,7 +216,7 @@ class PlayersViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 cacheIndex = index
                 applyPlayers(index.players, index.total)
-                _state.update { it.copy(sync = LeaderboardSync.Ready(index.fetchedAt, index.complete)) }
+                _state.update { it.copy(sync = LeaderboardSync.Ready(index.fetchedAt, index.complete, index.season)) }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: LeaderboardException) {
@@ -231,7 +231,7 @@ class PlayersViewModel(app: Application) : AndroidViewModel(app) {
         // Keep showing a previous index if there is one; otherwise surface the error.
         val cached = cacheIndex
         _state.update {
-            it.copy(sync = if (it.players.isNotEmpty() && cached != null) LeaderboardSync.Ready(cached.fetchedAt, cached.complete) else LeaderboardSync.Failed(message))
+            it.copy(sync = if (it.players.isNotEmpty() && cached != null) LeaderboardSync.Ready(cached.fetchedAt, cached.complete, cached.season) else LeaderboardSync.Failed(message))
         }
     }
 
@@ -553,7 +553,7 @@ private fun SyncLine(sync: LeaderboardSync, indexed: Int, onRefresh: () -> Unit)
         is LeaderboardSync.Ready -> Row(verticalAlignment = Alignment.CenterVertically) {
             val ago = DateUtils.getRelativeTimeSpanString(sync.fetchedAt, System.currentTimeMillis(), DateUtils.MINUTE_IN_MILLIS)
             Text(
-                "${indexed.fmt()} players · updated $ago" + if (!sync.complete) " · partial" else "",
+                "${indexed.fmt()} players · " + (sync.season?.let { "$it season · " } ?: "") + "updated $ago" + if (!sync.complete) " · partial" else "",
                 fontSize = 12.sp,
                 fontWeight = FontWeight.SemiBold,
                 color = Palette.Muted,

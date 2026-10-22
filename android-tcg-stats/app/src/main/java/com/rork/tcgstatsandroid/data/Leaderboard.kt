@@ -68,7 +68,12 @@ data class LeaderboardIndex(
     val total: Int,
     val complete: Boolean,
     val players: List<LeaderboardPlayer>,
+    /** Season label shown in the UI, e.g. "2026". */
+    val season: String? = null,
 )
+
+/** A Championship Points season as listed in the leaderboard page's season picker. */
+data class LeaderboardSeason(val id: String, val label: String)
 
 /**
  * Downloads the Play! Pokémon TCG Championship Points leaderboard. The site has no name search, so the whole
@@ -86,13 +91,37 @@ object Leaderboard {
     @Suppress("UNUSED_PARAMETER")
     fun pageUrl(division: Division): String = PAGE_URL
 
-    private fun apiUrl(division: Division, page: Int, perPage: Int) =
-        "$API${division.slug}/?per_page=$perPage&page=$page&include=metadata&format=json"
+    /**
+     * Without `leaderboard_type=championship` the API answers with the (empty) Play! Points board, and
+     * `leaderboard_when` selects the season.
+     */
+    private fun apiUrl(division: Division, season: String?, page: Int, perPage: Int) =
+        "$API${division.slug}/?leaderboard_type=championship" +
+            (season?.let { "&leaderboard_when=$it" } ?: "") +
+            "&leaderboard_who=&per_page=$perPage&page=$page&include=metadata&format=json"
+
+    /** Known season ids (from the site's picker), used when the page can't be read. */
+    private val FALLBACK_SEASONS = listOf(LeaderboardSeason("60", "2026"))
+
+    private val SEASON_OPTION = Regex("""<option[^>]*class="[^"]*championship[^"]*"[^>]*value="(\d+)"[^>]*>\s*([^<]*?)\s*<""")
+
+    /** Overall-season entries (label is just a year), newest first. Event-only entries like "NAIC 2026" are skipped. */
+    fun parseSeasons(html: String): List<LeaderboardSeason> =
+        SEASON_OPTION.findAll(html)
+            .mapNotNull { m ->
+                val label = m.groupValues[2].trim()
+                val year = label.takeIf { it.length == 4 }?.toIntOrNull() ?: return@mapNotNull null
+                LeaderboardSeason(m.groupValues[1], label) to year
+            }
+            .distinctBy { it.first.id }
+            .sortedByDescending { it.second }
+            .map { it.first }
+            .toList()
 
     // ---------- Cache ----------
 
     private fun cacheFile(context: Context, division: Division) =
-        File(context.filesDir, "leaderboard").apply { mkdirs() }.let { File(it, "${division.slug}-v1.json") }
+        File(context.filesDir, "leaderboard").apply { mkdirs() }.let { File(it, "${division.slug}-v2.json") }
 
     suspend fun cached(context: Context, division: Division): LeaderboardIndex? = withContext(Dispatchers.IO) {
         val file = cacheFile(context, division)
@@ -130,11 +159,11 @@ object Leaderboard {
         var web: WebFetcher? = null
         val fetchMutex = Mutex()
 
-        suspend fun fetchText(url: String): String {
+        suspend fun fetchText(url: String, accept: String = "application/json, text/plain, */*", valid: (String) -> Boolean = { it.trimStart().startsWith("{") }): String {
             web?.let { return it.get(url) }
-            val native = runCatching { LimitlessClient.httpGet(url, "application/json, text/plain, */*", UA) }
+            val native = runCatching { LimitlessClient.httpGet(url, accept, UA) }
             val body = native.getOrNull()
-            if (body != null && body.trimStart().startsWith("{")) return body
+            if (body != null && valid(body)) return body
             Log.d("Leaderboard", "native fetch blocked (${native.exceptionOrNull()?.message ?: "HTML"}), switching to WebView")
             val fetcher = fetchMutex.withLock {
                 web ?: WebFetcher(activity).also { it.open(PAGE_URL); web = it }
@@ -142,13 +171,13 @@ object Leaderboard {
             return fetcher.get(url)
         }
 
-        suspend fun fetchPage(page: Int, perPage: Int): Page {
+        suspend fun fetchPage(season: String?, page: Int, perPage: Int): Page {
             var attempt = 0
             while (true) {
                 try {
-                    val text = fetchText(apiUrl(division, page, perPage))
+                    val text = fetchText(apiUrl(division, season, page, perPage))
                     if (!text.trimStart().startsWith("{")) throw BlockedException()
-                    return parse(text)
+                    return parse(text, page)
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
@@ -160,14 +189,38 @@ object Leaderboard {
         }
 
         try {
-            val first = try {
-                fetchPage(1, REQUESTED_PER_PAGE)
-            } catch (e: BlockedException) {
-                throw LeaderboardException("Pokémon's leaderboard is temporarily limiting requests. Try again in a minute.")
-            } catch (e: LeaderboardException) {
-                throw LeaderboardException("Couldn't reach the Pokémon leaderboard. Check your connection and try again.")
+            // The season ids come from the page's own picker; try the newest season first, then older ones.
+            val html = fetchText(PAGE_URL, "text/html,application/xhtml+xml") { it.contains("leaderboardWhenFilter") }
+            val seasons = parseSeasons(html).ifEmpty { FALLBACK_SEASONS }
+            Log.d("Leaderboard", "seasons: " + seasons.joinToString { "${it.label}=${it.id}" })
+            val candidates: List<LeaderboardSeason?> = seasons.take(2) + listOf(null)
+
+            var first: Page? = null
+            var season: LeaderboardSeason? = null
+            var lastError: Exception? = null
+            var responded = false
+            for (candidate in candidates) {
+                try {
+                    val page = fetchPage(candidate?.id, 1, REQUESTED_PER_PAGE)
+                    responded = true
+                    Log.d("Leaderboard", "${division.slug} season ${candidate?.id ?: "default"}: ${page.records.size} records")
+                    if (page.records.isNotEmpty()) { first = page; season = candidate; break }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    lastError = e
+                }
             }
-            if (first.records.isEmpty()) throw LeaderboardException("The ${division.label} leaderboard is empty right now.")
+            if (first == null) {
+                throw LeaderboardException(
+                    when {
+                        responded -> "The ${division.label} leaderboard is empty right now."
+                        lastError is BlockedException -> "Pokémon's leaderboard is temporarily limiting requests. Try again in a minute."
+                        else -> "Couldn't reach the Pokémon leaderboard. Check your connection and try again."
+                    }
+                )
+            }
+            val seasonId = season?.id
             val perPage = first.records.size
             val total = first.total ?: first.records.size
             val pageCount = first.pageCount?.takeIf { it > 0 } ?: ceil(total / perPage.toDouble()).toInt()
@@ -185,7 +238,7 @@ object Leaderboard {
                     (2..pageCount).map { page ->
                         async {
                             semaphore.withPermit {
-                                val result = runCatching { fetchPage(page, REQUESTED_PER_PAGE) }
+                                val result = runCatching { fetchPage(seasonId, page, REQUESTED_PER_PAGE) }
                                 result.exceptionOrNull()?.let { if (it is CancellationException) throw it }
                                 val records = result.getOrNull()?.records
                                 if (records == null) failed.incrementAndGet() else records.forEach { collected[it.key] = it }
@@ -202,6 +255,7 @@ object Leaderboard {
                 total = total,
                 complete = failed.get() == 0,
                 players = players,
+                season = season?.label,
             )
             Log.d("Leaderboard", "${division.slug}: indexed ${players.size}/$total (failed pages ${failed.get()})")
             save(activity.applicationContext, division, index)
@@ -211,16 +265,17 @@ object Leaderboard {
         }
     }
 
-    private fun parse(text: String): Page {
+    private fun parse(text: String, page: Int): Page {
         val root = LimitlessClient.json.parseToJsonElement(text).jsonObject
         val board = root["leaderboard"] as? JsonObject
         val meta = (root["_metadata"] as? JsonObject) ?: (board?.get("_metadata") as? JsonObject)
         val boardMeta = board?.get("_metadata") as? JsonObject
         val records = (board?.get("records") as? JsonArray) ?: (root["records"] as? JsonArray) ?: JsonArray(emptyList())
-        val players = records.mapNotNull { el ->
-            val o = el as? JsonObject ?: return@mapNotNull null
-            val rank = o.int("rank") ?: return@mapNotNull null
-            val name = o.str("screen_name") ?: o.str("name") ?: return@mapNotNull null
+        val perPage = meta?.int("per_page") ?: boardMeta?.int("per_page") ?: records.size
+        val players = records.mapIndexedNotNull { i, el ->
+            val o = el as? JsonObject ?: return@mapIndexedNotNull null
+            val rank = o.int("rank") ?: ((page - 1) * perPage + i + 1)
+            val name = (o.str("screen_name") ?: o.str("name"))?.replace("\\'", "'") ?: return@mapIndexedNotNull null
             LeaderboardPlayer(
                 rank = rank,
                 name = name,

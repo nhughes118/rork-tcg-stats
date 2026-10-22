@@ -21,6 +21,7 @@ final class PlayersModel {
     private(set) var total = 0
     private(set) var results: [LeaderboardPlayer] = []
     private(set) var me: LeaderboardPlayer?
+    private(set) var season: String?
 
     @ObservationIgnored private var normalized: [String] = []
     @ObservationIgnored private var cacheIndex: LeaderboardIndex?
@@ -58,6 +59,7 @@ final class PlayersModel {
         results = []
         total = 0
         me = nil
+        season = nil
         sync = .idle
     }
 
@@ -66,6 +68,7 @@ final class PlayersModel {
         let d = division
         if cacheIndex == nil, let cached = await Leaderboard.cached(d), d == division {
             cacheIndex = cached
+            season = cached.season
             await apply(cached.players, total: cached.total)
             sync = .ready(cached.fetchedAt, complete: cached.complete)
         }
@@ -92,6 +95,7 @@ final class PlayersModel {
                 }
                 guard let self, !Task.isCancelled, self.division == d else { return }
                 self.cacheIndex = index
+                self.season = index.season
                 await self.apply(index.players, total: index.total)
                 self.sync = .ready(index.fetchedAt, complete: index.complete)
             } catch is CancellationError {
@@ -299,7 +303,7 @@ struct PlayersView: View {
             }
         case .ready(let date, let complete):
             HStack {
-                Text("\(model.players.count.grouped) players · updated \(date.formatted(.relative(presentation: .named)))\(complete ? "" : " · partial")")
+                Text("\(model.players.count.grouped) players · \(model.season.map { "\($0) season · " } ?? "")updated \(date.formatted(.relative(presentation: .named)))\(complete ? "" : " · partial")")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(Theme.muted)
                 Spacer(minLength: 8)

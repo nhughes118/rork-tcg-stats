@@ -33,4 +33,12 @@ nonisolated struct LeaderboardIndex: Codable, Sendable {
     let total: Int
     let complete: Bool
     let players: [LeaderboardPlayer]
+    /// Season label shown in the UI, e.g. "2026".
+    var season: String? = nil
+}
+
+/// A Championship Points season as listed in the leaderboard page's season picker.
+nonisolated struct LeaderboardSeason: Sendable, Hashable {
+    let id: String
+    let label: String
 }

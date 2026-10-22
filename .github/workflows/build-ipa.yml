@@ -1,0 +1,92 @@
+name: Build TCG Stats IPA
+
+on:
+  workflow_dispatch: # Allows manual trigger from the Actions tab
+
+jobs:
+  build:
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Inspect and Setup Project
+        id: setup
+        working-directory: ios-tcg-stats
+        run: |
+          # 1. Install CocoaPods if a Podfile exists
+          if [ -f "Podfile" ]; then
+            echo "Podfile detected, running pod install..."
+            pod install --repo-update
+          fi
+
+          # 2. Check for Workspace vs Xcodeproj
+          if compgen -G "*.xcworkspace" > /dev/null; then
+            TARGET_FILE="$(ls -d *.xcworkspace | head -n 1)"
+            FLAG="-workspace"
+          elif compgen -G "*.xcodeproj" > /dev/null; then
+            TARGET_FILE="$(ls -d *.xcodeproj | head -n 1)"
+            FLAG="-project"
+          else
+            echo "Error: Neither .xcworkspace nor .xcodeproj found in ios-tcg-stats/"
+            exit 1
+          fi
+
+          # 3. Detect the primary scheme
+          SCHEME=$(xcodebuild $FLAG "$TARGET_FILE" -list -json | python3 -c '
+          import sys, json
+          try:
+              data = json.load(sys.stdin)
+              schemes = data.get("workspace", {}).get("schemes", []) or data.get("project", {}).get("schemes", [])
+              if schemes:
+                  print(schemes[0])
+              else:
+                  sys.exit(1)
+          except Exception:
+              sys.exit(1)
+          ')
+
+          echo "Target: $TARGET_FILE ($FLAG)"
+          echo "Selected Scheme: $SCHEME"
+
+          echo "target_flag=$FLAG" >> "$GITHUB_OUTPUT"
+          echo "target_file=$TARGET_FILE" >> "$GITHUB_OUTPUT"
+          echo "scheme=$SCHEME" >> "$GITHUB_OUTPUT"
+
+      - name: Build Archive (Unsigned)
+        working-directory: ios-tcg-stats
+        run: |
+          xcodebuild clean archive \
+            ${{ steps.setup.outputs.target_flag }} "${{ steps.setup.outputs.target_file }}" \
+            -scheme "${{ steps.setup.outputs.scheme }}" \
+            -destination "generic/platform=iOS" \
+            -archivePath "./build/App.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES
+
+      - name: Package Payload into IPA
+        working-directory: ios-tcg-stats
+        run: |
+          mkdir -p Payload
+          APP_PATH=$(find ./build/App.xcarchive/Products/Applications -maxdepth 1 -name "*.app" | head -n 1)
+          
+          if [ -z "$APP_PATH" ]; then
+            echo "Error: .app file not found in build archive."
+            exit 1
+          fi
+
+          cp -r "$APP_PATH" Payload/
+          zip -r -X "${{ steps.setup.outputs.scheme }}-unsigned.ipa" Payload
+          rm -rf Payload
+
+      - name: Upload IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.setup.outputs.scheme }}-ipa
+          path: ios-tcg-stats/*.ipa
+          retention-days: 7

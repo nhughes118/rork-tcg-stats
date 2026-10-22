@@ -361,7 +361,7 @@ struct PlayersView: View {
                         .buttonStyle(PlayersPressStyle())
                 }
             }
-            Button { openURL(Leaderboard.pageURL) } label: {
+            Button { openURL(model.division.pageURL) } label: {
                 Label("Full leaderboard on Pokémon.com", systemImage: "arrow.up.right.square")
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(Theme.blue)
@@ -411,7 +411,7 @@ struct PlayersView: View {
                             .tint(Theme.blue)
                     }
                     if showLink {
-                        Button("Open on Pokémon.com") { openURL(Leaderboard.pageURL) }
+                        Button("Open on Pokémon.com") { openURL(model.division.pageURL) }
                             .buttonStyle(.bordered)
                             .tint(Theme.blue)
                     }
@@ -634,7 +634,7 @@ private struct PlayerDetailSheet: View {
                 .tint(isMe ? Theme.ink : Theme.red)
                 .sensoryFeedback(.success, trigger: tracked)
 
-                Button { openURL(Leaderboard.pageURL) } label: {
+                Button { openURL(division.pageURL) } label: {
                     Label("Leaderboard on Pokémon.com", systemImage: "arrow.up.right.square")
                         .font(.headline)
                         .frame(maxWidth: .infinity)

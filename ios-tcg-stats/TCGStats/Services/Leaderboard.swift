@@ -10,7 +10,6 @@ nonisolated struct LeaderboardError: LocalizedError, Sendable {
 /// Downloads the Play! Pokémon TCG Championship Points leaderboard. The site has no name search, so the whole
 /// division is indexed once (cached on disk for 12 hours) and searched locally.
 nonisolated enum Leaderboard {
-    static let pageURL = URL(string: "https://www.pokemon.com/us/play-pokemon/leaderboards/tcg-masters/")!
     private static let api = "https://www.pokemon.com/us/play-pokemon/leaderboards/op/api/"
     private static let cacheTTL: TimeInterval = 12 * 3600
     private static let requestedPerPage = 100
@@ -310,8 +309,11 @@ nonisolated enum Leaderboard {
 }
 
 extension Division {
-    /// The division's public leaderboard page (the API slug is singular, the page slug plural).
-    nonisolated var pageURL: URL { URL(string: "https://www.pokemon.com/us/play-pokemon/leaderboards/\(rawValue)s/")! }
+    /// The division's public leaderboard page (Masters lives at `tcg-masters/`, the others at their API slug).
+    nonisolated var pageURL: URL {
+        let slug = self == .masters ? "tcg-masters" : rawValue
+        return URL(string: "https://www.pokemon.com/us/play-pokemon/leaderboards/\(slug)/")!
+    }
     nonisolated var league: String { String(rawValue.dropFirst(4)) }
 }
 

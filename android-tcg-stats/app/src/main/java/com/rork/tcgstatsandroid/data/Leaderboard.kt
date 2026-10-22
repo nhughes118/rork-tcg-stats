@@ -52,8 +52,8 @@ enum class Division(val slug: String, val label: String) {
     Seniors("tcg-senior", "Seniors"),
     Juniors("tcg-junior", "Juniors");
 
-    /** The division's public leaderboard page (the API slug is singular, the page slug plural). */
-    val pageUrl: String get() = "https://www.pokemon.com/us/play-pokemon/leaderboards/${slug}s/"
+    /** The division's public leaderboard page (Masters lives at `tcg-masters/`, the others at their API slug). */
+    val pageUrl: String get() = "https://www.pokemon.com/us/play-pokemon/leaderboards/${if (this == Masters) "tcg-masters" else slug}/"
     val league: String get() = slug.removePrefix("tcg-")
 }
 
@@ -89,14 +89,11 @@ data class LeaderboardSeason(val id: String, val label: String)
  */
 object Leaderboard {
     private const val API = "https://www.pokemon.com/us/play-pokemon/leaderboards/op/api/"
-    const val PAGE_URL = "https://www.pokemon.com/us/play-pokemon/leaderboards/tcg-masters/"
     private const val CACHE_TTL_MS = 12 * 3_600_000L
     private const val REQUESTED_PER_PAGE = 100
     private const val CONCURRENCY = 5
 
-    /** The official page has its own division switcher, so every division links to the same page. */
-    @Suppress("UNUSED_PARAMETER")
-    fun pageUrl(division: Division): String = PAGE_URL
+    fun pageUrl(division: Division): String = division.pageUrl
 
     /** Known season id (from the site's picker), used when the page can't be read. */
     private val FALLBACK_SEASON = LeaderboardSeason("60", "2026")

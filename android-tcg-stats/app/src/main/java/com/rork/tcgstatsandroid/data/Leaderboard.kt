@@ -3,6 +3,7 @@ package com.rork.tcgstatsandroid.data
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.Context
+import android.net.Uri
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
@@ -12,6 +13,8 @@ import android.webkit.JavascriptInterface
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.FrameLayout
+import androidx.webkit.WebViewCompat
+import androidx.webkit.WebViewFeature
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
@@ -35,6 +38,7 @@ import kotlinx.serialization.json.doubleOrNull
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonObject
 import java.io.File
+import java.net.URLEncoder
 import java.text.Normalizer
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
@@ -46,7 +50,11 @@ class LeaderboardException(message: String) : Exception(message)
 enum class Division(val slug: String, val label: String) {
     Masters("tcg-master", "Masters"),
     Seniors("tcg-senior", "Seniors"),
-    Juniors("tcg-junior", "Juniors"),
+    Juniors("tcg-junior", "Juniors");
+
+    /** The division's public leaderboard page (the API slug is singular, the page slug plural). */
+    val pageUrl: String get() = "https://www.pokemon.com/us/play-pokemon/leaderboards/${slug}s/"
+    val league: String get() = slug.removePrefix("tcg-")
 }
 
 @Serializable
@@ -85,43 +93,76 @@ object Leaderboard {
     private const val CACHE_TTL_MS = 12 * 3_600_000L
     private const val REQUESTED_PER_PAGE = 1000
     private const val CONCURRENCY = 5
-    private const val UA = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0 Mobile Safari/537.36"
 
     /** The official page has its own division switcher, so every division links to the same page. */
     @Suppress("UNUSED_PARAMETER")
     fun pageUrl(division: Division): String = PAGE_URL
 
-    /**
-     * Without `leaderboard_type=championship` the API answers with the (empty) Play! Points board, and
-     * `leaderboard_when` selects the season.
-     */
-    private fun apiUrl(division: Division, season: String?, page: Int, perPage: Int) =
-        "$API${division.slug}/?leaderboard_type=championship" +
-            (season?.let { "&leaderboard_when=$it" } ?: "") +
-            "&leaderboard_who=&per_page=$perPage&page=$page&include=metadata&format=json"
+    /** Known season id (from the site's picker), used when the page can't be read. */
+    private val FALLBACK_SEASON = LeaderboardSeason("60", "2026")
 
-    /** Known season ids (from the site's picker), used when the page can't be read. */
-    private val FALLBACK_SEASONS = listOf(LeaderboardSeason("60", "2026"))
+    /** What the live page selected by default, plus the API request its own script made with those values. */
+    private class PageSetup(
+        val ready: Boolean,
+        val capturedUrl: String? = null,
+        val capturedBody: String? = null,
+        val type: String? = null,
+        val zone: String? = null,
+        val whenId: String? = null,
+        val whenLabel: String? = null,
+        val whenOptions: Map<String, String> = emptyMap(),
+    )
 
-    private val SEASON_OPTION = Regex("""<option[^>]*class="[^"]*championship[^"]*"[^>]*value="(\d+)"[^>]*>\s*([^<]*?)\s*<""")
+    /** An API URL with its query split out so paging can be swapped. */
+    private class Template(val base: String, val params: List<Pair<String, String>>) {
+        fun url(page: Int, perPage: Int?): String {
+            val items = params.filter { it.first != "page" && (it.first != "per_page" || perPage == null) }.toMutableList()
+            if (perPage != null) items += "per_page" to perPage.toString()
+            items += "page" to page.toString()
+            if (items.none { it.first == "format" }) items += "format" to "json"
+            return base + "?" + items.joinToString("&") { "${enc(it.first)}=${enc(it.second)}" }
+        }
 
-    /** Overall-season entries (label is just a year), newest first. Event-only entries like "NAIC 2026" are skipped. */
-    fun parseSeasons(html: String): List<LeaderboardSeason> =
-        SEASON_OPTION.findAll(html)
-            .mapNotNull { m ->
-                val label = m.groupValues[2].trim()
-                val year = label.takeIf { it.length == 4 }?.toIntOrNull() ?: return@mapNotNull null
-                LeaderboardSeason(m.groupValues[1], label) to year
-            }
-            .distinctBy { it.first.id }
-            .sortedByDescending { it.second }
-            .map { it.first }
-            .toList()
+        val describe: String get() = url(1, null)
+        fun param(name: String) = params.firstOrNull { it.first == name }?.second
+
+        companion object {
+            private fun enc(s: String) = URLEncoder.encode(s, "UTF-8")
+            fun parse(url: String): Template? = runCatching {
+                val uri = Uri.parse(url)
+                val base = url.substringBefore('?')
+                val params = uri.queryParameterNames.map { it to (uri.getQueryParameter(it) ?: "") }
+                Template(base, params)
+            }.getOrNull()
+        }
+    }
+
+    /** Request URLs to try, best first: the page's own request, then ones rebuilt from its dropdown values. */
+    private fun templates(division: Division, setup: PageSetup): List<Template> {
+        val out = ArrayList<Template>()
+        setup.capturedUrl?.let { Template.parse(it) }?.let { out += it }
+        val type = setup.type ?: "championship"
+        val whenId = setup.whenId ?: FALLBACK_SEASON.id
+        fun build(product: Boolean, season: String?): Template {
+            val items = mutableListOf("leaderboard_type" to type)
+            if (season != null) items += "leaderboard_when" to season
+            items += "leaderboard_who" to ""
+            if (product) { items += "product" to "tcg"; items += "league" to division.league }
+            setup.zone?.takeIf { it.isNotEmpty() && it != "All" }?.let { items += "zone" to it }
+            items += "include" to "metadata"
+            items += "format" to "json"
+            return Template("$API${division.slug}/", items)
+        }
+        out += build(true, whenId)
+        out += build(false, whenId)
+        out += build(true, null)
+        return out.distinctBy { it.describe }
+    }
 
     // ---------- Cache ----------
 
     private fun cacheFile(context: Context, division: Division) =
-        File(context.filesDir, "leaderboard").apply { mkdirs() }.let { File(it, "${division.slug}-v2.json") }
+        File(context.filesDir, "leaderboard").apply { mkdirs() }.let { File(it, "${division.slug}-v3.json") }
 
     suspend fun cached(context: Context, division: Division): LeaderboardIndex? = withContext(Dispatchers.IO) {
         val file = cacheFile(context, division)
@@ -149,82 +190,76 @@ object Leaderboard {
 
     /**
      * Indexes [division]. [onProgress] receives the players collected so far (unsorted) and the expected total.
-     * Native requests are tried first; if the bot wall answers with HTML, a hidden WebView session takes over.
+     * Every request runs inside a hidden WebView on the division's real page, so it carries the same bot-check
+     * cookies and dropdown defaults as a visitor's browser.
      */
     suspend fun load(
         activity: Activity,
         division: Division,
         onProgress: suspend (List<LeaderboardPlayer>, Int) -> Unit,
     ): LeaderboardIndex {
-        var web: WebFetcher? = null
-        val fetchMutex = Mutex()
+        val web = WebFetcher(activity)
 
-        suspend fun fetchText(url: String, accept: String = "application/json, text/plain, */*", valid: (String) -> Boolean = { it.trimStart().startsWith("{") }): String {
-            web?.let { return it.get(url) }
-            val native = runCatching { LimitlessClient.httpGet(url, accept, UA) }
-            val body = native.getOrNull()
-            if (body != null && valid(body)) return body
-            Log.d("Leaderboard", "native fetch blocked (${native.exceptionOrNull()?.message ?: "HTML"}), switching to WebView")
-            val fetcher = fetchMutex.withLock {
-                web ?: WebFetcher(activity).also { it.open(PAGE_URL); web = it }
-            }
-            return fetcher.get(url)
-        }
-
-        suspend fun fetchPage(season: String?, page: Int, perPage: Int): Page {
+        suspend fun fetchPage(template: Template, page: Int, perPage: Int?, attempts: Int = 3): Page {
+            val url = template.url(page, perPage)
             var attempt = 0
             while (true) {
                 try {
-                    val text = fetchText(apiUrl(division, season, page, perPage))
-                    if (!text.trimStart().startsWith("{")) throw BlockedException()
+                    val text = web.get(url)
+                    if (!text.trimStart().startsWith("{")) {
+                        if (attempt + 1 >= attempts) Log.d("Leaderboard", "page $page failed: $url -> ${text.take(160)}")
+                        throw BlockedException()
+                    }
                     return parse(text, page)
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
                     attempt++
-                    if (attempt >= 3) throw if (e is BlockedException) e else LeaderboardException(e.message ?: "")
+                    if (attempt >= attempts) throw if (e is BlockedException) e else LeaderboardException(e.message ?: "")
                     delay(1_200L * attempt)
                 }
             }
         }
 
         try {
-            // The season ids come from the page's own picker; try the newest season first, then older ones.
-            val html = fetchText(PAGE_URL, "text/html,application/xhtml+xml") { it.contains("leaderboardWhenFilter") }
-            val seasons = parseSeasons(html).ifEmpty { FALLBACK_SEASONS }
-            Log.d("Leaderboard", "seasons: " + seasons.joinToString { "${it.label}=${it.id}" })
-            val candidates: List<LeaderboardSeason?> = seasons.take(2) + listOf(null)
+            val setup = web.open(division.pageUrl)
+            Log.d("Leaderboard", "${division.slug} page ready=${setup.ready} type=${setup.type} when=${setup.whenId} (${setup.whenLabel}) zone=${setup.zone}")
+            Log.d("Leaderboard", "captured: ${setup.capturedUrl ?: "none"} body=${setup.capturedBody?.take(200) ?: "none"}")
+            if (!setup.ready) {
+                throw LeaderboardException("Pokémon's leaderboard page didn't load. It may be limiting requests, so try again in a minute.")
+            }
 
             var first: Page? = null
-            var season: LeaderboardSeason? = null
-            var lastError: Exception? = null
+            var chosen: Pair<Template, Int?>? = null
             var responded = false
-            for (candidate in candidates) {
-                try {
-                    val page = fetchPage(candidate?.id, 1, REQUESTED_PER_PAGE)
-                    responded = true
-                    Log.d("Leaderboard", "${division.slug} season ${candidate?.id ?: "default"}: ${page.records.size} records")
-                    if (page.records.isNotEmpty()) { first = page; season = candidate; break }
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    lastError = e
+            probe@ for ((i, template) in templates(division, setup).withIndex()) {
+                val sizes: List<Int?> = if (i == 0 && setup.capturedUrl != null) listOf(REQUESTED_PER_PAGE, 100, null) else listOf(REQUESTED_PER_PAGE, 100)
+                for (size in sizes) {
+                    try {
+                        val page = fetchPage(template, 1, size, attempts = 2)
+                        responded = true
+                        Log.d("Leaderboard", "probe ${template.describe} per_page=${size ?: "page"} -> ${page.records.size} records, total ${page.total}")
+                        if (page.records.isNotEmpty()) { first = page; chosen = template to size; break@probe }
+                        break
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        continue
+                    }
                 }
             }
-            if (first == null) {
+            if (first == null || chosen == null) {
                 throw LeaderboardException(
-                    when {
-                        responded -> "The ${division.label} leaderboard is empty right now."
-                        lastError is BlockedException -> "Pokémon's leaderboard is temporarily limiting requests. Try again in a minute."
-                        else -> "Couldn't reach the Pokémon leaderboard. Check your connection and try again."
-                    }
+                    if (responded) "The ${division.label} leaderboard is empty right now."
+                    else "Pokémon's leaderboard didn't respond. It may be limiting requests, so try again in a minute."
                 )
             }
-            val seasonId = season?.id
+            val (template, size) = chosen
+            val seasonLabel = template.param("leaderboard_when")?.let { setup.whenOptions[it] } ?: setup.whenLabel
             val perPage = first.records.size
             val total = first.total ?: first.records.size
             val pageCount = first.pageCount?.takeIf { it > 0 } ?: ceil(total / perPage.toDouble()).toInt()
-            Log.d("Leaderboard", "${division.slug}: total=$total perPage=$perPage pages=$pageCount")
+            Log.d("Leaderboard", "${division.slug}: total=$total perPage=$perPage pages=$pageCount season=$seasonLabel")
 
             val collected = ConcurrentHashMap<String, LeaderboardPlayer>()
             first.records.forEach { collected[it.key] = it }
@@ -238,7 +273,7 @@ object Leaderboard {
                     (2..pageCount).map { page ->
                         async {
                             semaphore.withPermit {
-                                val result = runCatching { fetchPage(seasonId, page, REQUESTED_PER_PAGE) }
+                                val result = runCatching { fetchPage(template, page, size) }
                                 result.exceptionOrNull()?.let { if (it is CancellationException) throw it }
                                 val records = result.getOrNull()?.records
                                 if (records == null) failed.incrementAndGet() else records.forEach { collected[it.key] = it }
@@ -255,13 +290,13 @@ object Leaderboard {
                 total = total,
                 complete = failed.get() == 0,
                 players = players,
-                season = season?.label,
+                season = seasonLabel,
             )
             Log.d("Leaderboard", "${division.slug}: indexed ${players.size}/$total (failed pages ${failed.get()})")
             save(activity.applicationContext, division, index)
             return index
         } finally {
-            web?.close()
+            web.close()
         }
     }
 
@@ -321,6 +356,53 @@ object Leaderboard {
 
     // ---------- Hidden WebView session ----------
 
+    /** Records every leaderboard API request the page's own script makes (and its response). */
+    private const val HOOK_JS = """
+    (function(){
+      if (window.__lbHooked) return; window.__lbHooked = true; window.__lbReqs = [];
+      var open = XMLHttpRequest.prototype.open;
+      XMLHttpRequest.prototype.open = function(m, u) {
+        try {
+          var abs = new URL(u, location.href).href;
+          if (abs.indexOf('leaderboard_type') >= 0) {
+            var entry = {url: abs, body: null}; window.__lbReqs.push(entry);
+            var xhr = this;
+            this.addEventListener('loadend', function(){ try { entry.body = xhr.responseText || ''; } catch(e) { entry.body = ''; } });
+          }
+        } catch (e) {}
+        return open.apply(this, arguments);
+      };
+    })();
+    """
+
+    /** Waits for the page's first leaderboard request, then reports it with the dropdowns' selected values. */
+    private const val DISCOVER_JS = """
+    (async function(){
+      const pick = () => {
+        const reqs = (window.__lbReqs || []).filter(r => r.url.indexOf('isUserStats') < 0);
+        return reqs.length ? reqs[reqs.length - 1] : null;
+      };
+      for (let i = 0; i < 30; i++) {
+        const r = pick();
+        if (r && r.body !== null) break;
+        await new Promise(res => setTimeout(res, 500));
+      }
+      const r = pick();
+      const val = id => { const s = document.getElementById(id); return s ? s.value : null; };
+      const w = document.getElementById('leaderboardWhenFilter');
+      const opt = w && w.selectedIndex >= 0 ? w.options[w.selectedIndex] : null;
+      return JSON.stringify({
+        url: r ? r.url : null,
+        body: r && r.body ? r.body.slice(0, 4000) : null,
+        type: val('leaderboardTypeFilter'),
+        zone: val('leaderboardZoneFilter'),
+        when: w ? w.value : null,
+        whenLabel: opt ? opt.text.trim() : null,
+        options: w ? Array.from(w.options).map(o => [o.value, o.text.trim()]) : []
+      });
+    })()
+    """
+
     /** Passes the site's bot check in a real browser context, then issues same-origin fetches from the page. */
     @SuppressLint("SetJavaScriptEnabled", "JavascriptInterface")
     private class WebFetcher(private val activity: Activity) {
@@ -328,53 +410,85 @@ object Leaderboard {
         private val pending = ConcurrentHashMap<Int, CompletableDeferred<String>>()
         private val ids = AtomicInteger(0)
         private var web: WebView? = null
-        private var ready = CompletableDeferred<Unit>()
+        private val ready = CompletableDeferred<Unit>()
 
-        suspend fun open(url: String) = withContext(Dispatchers.Main) {
-            val view = WebView(activity)
-            view.settings.javaScriptEnabled = true
-            view.settings.domStorageEnabled = true
-            view.settings.loadsImagesAutomatically = false
-            CookieManager.getInstance().setAcceptCookie(true)
-            CookieManager.getInstance().setAcceptThirdPartyCookies(view, true)
-            view.addJavascriptInterface(object {
-                @JavascriptInterface
-                fun post(id: Int, body: String) {
-                    pending.remove(id)?.complete(body)
+        suspend fun open(url: String): PageSetup {
+            withContext(Dispatchers.Main) {
+                val view = WebView(activity)
+                view.settings.javaScriptEnabled = true
+                view.settings.domStorageEnabled = true
+                view.settings.loadsImagesAutomatically = false
+                CookieManager.getInstance().setAcceptCookie(true)
+                CookieManager.getInstance().setAcceptThirdPartyCookies(view, true)
+                view.addJavascriptInterface(object {
+                    @JavascriptInterface
+                    fun post(id: Int, body: String) {
+                        pending.remove(id)?.complete(body)
+                    }
+                }, "TCGLeaderboard")
+                val documentStart = WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)
+                if (documentStart) {
+                    runCatching { WebViewCompat.addDocumentStartJavaScript(view, HOOK_JS, setOf("https://www.pokemon.com")) }
                 }
-            }, "TCGLeaderboard")
-            view.webViewClient = object : WebViewClient() {
-                override fun onPageFinished(v: WebView, u: String?) {
-                    // The bot check serves an interstitial that reloads itself; the real page defines pokemonUI.
-                    v.evaluateJavascript("(function(){return !!(window.pokemonUI||document.querySelector('#stats-leaderboards-selected-rankings'));})()") { r ->
-                        if (r == "true") ready.complete(Unit)
+                view.webViewClient = object : WebViewClient() {
+                    override fun onPageStarted(v: WebView, u: String?, favicon: android.graphics.Bitmap?) {
+                        if (!documentStart) v.evaluateJavascript(HOOK_JS, null)
+                    }
+
+                    override fun onPageFinished(v: WebView, u: String?) {
+                        // The bot check serves an interstitial that reloads itself; the real page has the rankings container.
+                        v.evaluateJavascript("(function(){return !!document.querySelector('#stats-leaderboards-selected-rankings') && !!window.jQuery;})()") { r ->
+                            if (r == "true") ready.complete(Unit)
+                        }
                     }
                 }
+                view.alpha = 0.01f
+                (activity.window.decorView as ViewGroup).addView(view, FrameLayout.LayoutParams(390, 844))
+                web = view
+                view.loadUrl(url)
             }
-            view.alpha = 0.01f
-            (activity.window.decorView as ViewGroup).addView(view, FrameLayout.LayoutParams(1, 1))
-            web = view
-            view.loadUrl(url)
-            // Even if the marker never shows, try fetching after the timeout: cookies may already be set.
-            withTimeoutOrNull(25_000) { ready.await() }
-            Unit
+            withTimeoutOrNull(30_000) { ready.await() } ?: return PageSetup(ready = false)
+
+            repeat(3) {
+                val json = runAsync(DISCOVER_JS, 25_000)
+                val o = runCatching { LimitlessClient.json.parseToJsonElement(json).jsonObject }.getOrNull()
+                if (o == null) { delay(1_000); return@repeat }
+                fun s(k: String) = (o[k] as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotEmpty() }
+                val options = LinkedHashMap<String, String>()
+                (o["options"] as? JsonArray)?.forEach { el ->
+                    val pair = el as? JsonArray ?: return@forEach
+                    val k = (pair.getOrNull(0) as? JsonPrimitive)?.contentOrNull ?: return@forEach
+                    val v = (pair.getOrNull(1) as? JsonPrimitive)?.contentOrNull ?: return@forEach
+                    options.putIfAbsent(k, v)
+                }
+                return PageSetup(
+                    ready = true,
+                    capturedUrl = s("url"),
+                    capturedBody = s("body"),
+                    type = s("type"),
+                    zone = s("zone"),
+                    whenId = s("when"),
+                    whenLabel = s("whenLabel"),
+                    whenOptions = options,
+                )
+            }
+            return PageSetup(ready = true)
         }
 
-        suspend fun get(url: String): String {
+        /** Runs a JS expression that yields a promise of a string and returns that string. */
+        private suspend fun runAsync(expression: String, timeoutMs: Long): String {
             val id = ids.incrementAndGet()
             val deferred = CompletableDeferred<String>()
             pending[id] = deferred
-            val js = """
-                (function(){
-                  fetch(${jsString(url)}, {credentials:'include', headers:{'Accept':'application/json, text/plain, */*','X-Requested-With':'XMLHttpRequest'}})
-                    .then(function(r){return r.text();})
-                    .then(function(t){TCGLeaderboard.post($id, t);})
-                    .catch(function(){TCGLeaderboard.post($id, '');});
-                })();
-            """.trimIndent()
+            val js = "Promise.resolve($expression).then(function(t){TCGLeaderboard.post($id, String(t));}).catch(function(){TCGLeaderboard.post($id, '');});"
             withContext(Dispatchers.Main) { web?.evaluateJavascript(js, null) }
-            return withTimeoutOrNull(30_000) { deferred.await() } ?: run { pending.remove(id); "" }
+            return withTimeoutOrNull(timeoutMs) { deferred.await() } ?: run { pending.remove(id); "" }
         }
+
+        suspend fun get(url: String): String = runAsync(
+            "fetch(${jsString(url)}, {credentials:'include', headers:{'Accept':'application/json, text/javascript, */*; q=0.01','X-Requested-With':'XMLHttpRequest'}}).then(function(r){return r.text();})",
+            30_000,
+        )
 
         fun close() {
             handler.post {

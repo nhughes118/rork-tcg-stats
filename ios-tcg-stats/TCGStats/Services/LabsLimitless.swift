@@ -30,6 +30,80 @@ nonisolated enum LabsLimitless {
     static func labsID(_ recordID: String) -> String { String(recordID.dropFirst(isLabsID(recordID) ? idPrefix.count : 0)) }
     static func pageURL(_ recordID: String) -> URL? { URL(string: "https://labs.limitlesstcg.com/\(labsID(recordID))/standings") }
 
+    /// Labs tournament and player ids encoded in a Labs player entry id (`labs-0076-445`).
+    static func playerRef(entryID: String) -> (tournament: String, player: Int)? {
+        guard isLabsID(entryID) else { return nil }
+        let parts = entryID.dropFirst(idPrefix.count).split(separator: "-")
+        guard parts.count == 2, let player = Int(parts[1]) else { return nil }
+        return (String(parts[0]), player)
+    }
+
+    static func playerURL(tournament: String, player: Int) -> URL? {
+        URL(string: "https://labs.limitlesstcg.com/\(tournament)/player/\(player)")
+    }
+
+    enum MatchResult: Sendable { case win, loss, tie }
+
+    struct LabsMatch: Identifiable, Sendable {
+        let round: Int
+        let isTopCut: Bool
+        let opponent: String?
+        let opponentDeck: String
+        let opponentIcons: [String]
+        let opponentRecord: String
+        let result: MatchResult
+        var id: Int { round }
+    }
+
+    private struct APIMatch: Decodable {
+        let round: FlexInt?
+        let phase: FlexInt?
+        let p1_id: FlexInt?
+        let p2_id: FlexInt?
+        let winner: FlexInt?
+        let p1_name: String?
+        let p2_name: String?
+        let p1_deck_name: String?
+        let p2_deck_name: String?
+        let p1_icons: String?
+        let p2_icons: String?
+        let p1_wins: FlexInt?
+        let p1_losses: FlexInt?
+        let p1_ties: FlexInt?
+        let p2_wins: FlexInt?
+        let p2_losses: FlexInt?
+        let p2_ties: FlexInt?
+    }
+
+    private static func record(_ w: FlexInt?, _ l: FlexInt?, _ t: FlexInt?) -> String {
+        let wins = w?.value ?? 0, losses = l?.value ?? 0, ties = t?.value ?? 0
+        return ties > 0 ? "\(wins)-\(losses)-\(ties)" : "\(wins)-\(losses)"
+    }
+
+    /// Every round a player played, latest first.
+    static func matches(tournament: String, player: Int) async throws -> [LabsMatch] {
+        let rows = try await get("matches?tournamentId=\(tournament)&playerId=\(player)", as: [APIMatch].self)
+        return rows.compactMap { m in
+            guard let round = m.round?.value else { return nil }
+            let isP1 = m.p1_id?.value == player
+            let oppID = isP1 ? m.p2_id?.value : m.p1_id?.value
+            let winner = m.winner?.value
+            let result: MatchResult = if oppID == nil || winner == player { .win } else if winner == 0 { .tie } else { .loss }
+            let deck = isP1 ? m.p2_deck_name : m.p1_deck_name
+            let icons = (isP1 ? m.p2_icons : m.p1_icons) ?? ""
+            return LabsMatch(
+                round: round,
+                isTopCut: (m.phase?.value ?? 1) >= 3,
+                opponent: oppID == nil ? nil : (isP1 ? m.p2_name : m.p1_name),
+                opponentDeck: (deck?.isEmpty == false ? deck : nil) ?? (oppID == nil ? "Bye" : "Unknown deck"),
+                opponentIcons: icons.split(separator: " ").map(String.init),
+                opponentRecord: isP1 ? record(m.p2_wins, m.p2_losses, m.p2_ties) : record(m.p1_wins, m.p1_losses, m.p1_ties),
+                result: result
+            )
+        }
+        .sorted { $0.round > $1.round }
+    }
+
     private struct Envelope<T: Decodable>: Decodable {
         let ok: Bool
         let message: T?

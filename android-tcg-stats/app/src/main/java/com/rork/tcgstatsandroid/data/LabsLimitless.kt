@@ -36,6 +36,63 @@ object LabsLimitless {
     fun labsId(recordId: String) = recordId.removePrefix(ID_PREFIX)
     fun pageUrl(recordId: String) = "https://labs.limitlesstcg.com/${labsId(recordId)}/standings"
 
+    data class PlayerRef(val tournament: String, val player: Int)
+
+    /** Labs tournament and player ids encoded in a Labs player entry id (`labs-0076-445`). */
+    fun playerRef(entryId: String): PlayerRef? {
+        if (!isLabsId(entryId)) return null
+        val parts = entryId.removePrefix(ID_PREFIX).split("-")
+        if (parts.size != 2) return null
+        val player = parts[1].toIntOrNull() ?: return null
+        return PlayerRef(parts[0], player)
+    }
+
+    fun playerUrl(ref: PlayerRef) = "https://labs.limitlesstcg.com/${ref.tournament}/player/${ref.player}"
+
+    enum class MatchResult { Win, Loss, Tie }
+
+    data class LabsMatch(
+        val round: Int,
+        val isTopCut: Boolean,
+        /** Null for a bye. */
+        val opponent: String?,
+        val opponentDeck: String,
+        val opponentIcons: List<String>,
+        val opponentRecord: String,
+        val result: MatchResult,
+    )
+
+    /** Every round a player played, latest first. */
+    suspend fun matches(ref: PlayerRef): List<LabsMatch> {
+        val list = get("matches?tournamentId=${ref.tournament}&playerId=${ref.player}") as? JsonArray
+            ?: throw LimitlessException("Matches unavailable.")
+        return list.mapNotNull { element ->
+            val m = element as? JsonObject ?: return@mapNotNull null
+            val round = m.int("round") ?: return@mapNotNull null
+            val isP1 = m.int("p1_id") == ref.player
+            val opp = if (isP1) "p2" else "p1"
+            val oppId = m.int("${opp}_id")
+            val winner = m.int("winner")
+            val result = when {
+                oppId == null || winner == ref.player -> MatchResult.Win
+                winner == 0 -> MatchResult.Tie
+                else -> MatchResult.Loss
+            }
+            val w = m.int("${opp}_wins") ?: 0
+            val l = m.int("${opp}_losses") ?: 0
+            val t = m.int("${opp}_ties") ?: 0
+            LabsMatch(
+                round = round,
+                isTopCut = (m.int("phase") ?: 1) >= 3,
+                opponent = if (oppId == null) null else m.str("${opp}_name") ?: "Player",
+                opponentDeck = m.str("${opp}_deck_name")?.takeIf { it.isNotBlank() } ?: if (oppId == null) "Bye" else "Unknown deck",
+                opponentIcons = m.str("${opp}_icons").orEmpty().split(" ").filter { it.isNotBlank() },
+                opponentRecord = if (t > 0) "$w-$l-$t" else "$w-$l",
+                result = result,
+            )
+        }.sortedByDescending { it.round }
+    }
+
     private suspend fun get(path: String): Any? {
         val text = LimitlessClient.httpGet("$API/$path", "application/json", OfficialLimitless.USER_AGENT)
         val root = LimitlessClient.json.parseToJsonElement(text) as? JsonObject ?: return null

@@ -143,10 +143,124 @@ struct DecklistSheet: View {
     var onOpenCard: ((String) -> Void)? = nil
     @State private var didCopy: Bool = false
     @State private var copyTask: Task<Void, Never>?
+    @State private var tab: SheetTab = .decklist
+    @State private var matches: [LabsLimitless.LabsMatch]?
+    @State private var matchesFailed = false
+
+    private enum SheetTab: Hashable { case decklist, matches }
+
+    /// Round-by-round results exist for Limitless Labs entries only.
+    private var labsRef: (tournament: String, player: Int)? { LabsLimitless.playerRef(entryID: entry.id) }
 
     var body: some View {
         NavigationStack {
             List {
+                if labsRef != nil {
+                    Section {
+                        Picker("View", selection: Binding(
+                            get: { tab },
+                            set: { value in withAnimation(.snappy) { tab = value } }
+                        )) {
+                            Text("Decklist").tag(SheetTab.decklist)
+                            Text("Matches").tag(SheetTab.matches)
+                        }
+                        .pickerStyle(.segmented)
+                        .sensoryFeedback(.selection, trigger: tab)
+                        .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
+                        .listRowBackground(Color.clear)
+                    }
+                }
+                if tab == .matches {
+                    matchesContent
+                } else {
+                    decklistContent
+                }
+            }
+            .navigationTitle(entry.name)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    ShareLink(item: shareText) {
+                        Image(systemName: "square.and.arrow.up")
+                    }
+                    .disabled(entry.cards.isEmpty)
+                    .accessibilityLabel("Share decklist")
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
+            .task(id: tab) { await loadMatches() }
+        }
+        .presentationDetents([.medium, .large])
+        .sensoryFeedback(.success, trigger: didCopy) { _, new in new }
+        .onDisappear { copyTask?.cancel() }
+    }
+
+    private func loadMatches() async {
+        guard tab == .matches, matches == nil, let ref = labsRef else { return }
+        matchesFailed = false
+        do { matches = try await LabsLimitless.matches(tournament: ref.tournament, player: ref.player) }
+        catch { matchesFailed = true }
+    }
+
+    @ViewBuilder
+    private var matchesContent: some View {
+        if let matches {
+            if matches.isEmpty {
+                Section { Text("No matches recorded for this player.").foregroundStyle(.secondary) }
+            } else {
+                Section("By opponent deck") {
+                    ForEach(MatchupSummary.make(matches)) { row in
+                        HStack(spacing: 12) {
+                            DeckIconView(icons: row.icons, size: 36)
+                            Text(row.deck)
+                                .foregroundStyle(Theme.ink)
+                                .lineLimit(1)
+                            Spacer(minLength: 8)
+                            Text(row.recordText)
+                                .font(.body.weight(.bold))
+                                .monospacedDigit()
+                                .foregroundStyle(row.wins > row.losses ? Theme.blue : row.losses > row.wins ? Theme.red : Theme.ink)
+                        }
+                    }
+                }
+                Section("Rounds") {
+                    ForEach(matches) { match in
+                        MatchRow(match: match)
+                    }
+                }
+                if let ref = labsRef, let url = LabsLimitless.playerURL(tournament: ref.tournament, player: ref.player) {
+                    Section {
+                        Link(destination: url) {
+                            Label("View on Limitless Labs", systemImage: "arrow.up.right.square")
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(Theme.blue)
+                        }
+                    }
+                }
+            }
+        } else if matchesFailed {
+            Section {
+                VStack(spacing: 10) {
+                    Text("Couldn't load matches from Limitless Labs.")
+                        .foregroundStyle(.secondary)
+                    Button("Try Again") { Task { await loadMatches() } }
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(Theme.blue)
+                }
+                .frame(maxWidth: .infinity, minHeight: 80)
+            }
+        } else {
+            Section {
+                ProgressView("Loading matches…")
+                    .frame(maxWidth: .infinity, minHeight: 80)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var decklistContent: some View {
                 Section {
                     HStack(spacing: 12) {
                         DeckIconView(icons: entry.deckIcons, size: 52)
@@ -199,25 +313,6 @@ struct DecklistSheet: View {
                         }
                     }
                 }
-            }
-            .navigationTitle(entry.name)
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    ShareLink(item: shareText) {
-                        Image(systemName: "square.and.arrow.up")
-                    }
-                    .disabled(entry.cards.isEmpty)
-                    .accessibilityLabel("Share decklist")
-                }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") { dismiss() }
-                }
-            }
-        }
-        .presentationDetents([.medium, .large])
-        .sensoryFeedback(.success, trigger: didCopy) { _, new in new }
-        .onDisappear { copyTask?.cancel() }
     }
 
     private var shareText: String {
@@ -233,6 +328,89 @@ struct DecklistSheet: View {
             guard !Task.isCancelled else { return }
             withAnimation(.spring(duration: 0.3)) { didCopy = false }
         }
+    }
+}
+
+/// A player's record against each opponent deck.
+private struct MatchupSummary: Identifiable {
+    let deck: String
+    let icons: [String]
+    var wins = 0
+    var losses = 0
+    var ties = 0
+    var id: String { deck }
+    var recordText: String { ties > 0 ? "\(wins)-\(losses)-\(ties)" : "\(wins)-\(losses)" }
+
+    static func make(_ matches: [LabsLimitless.LabsMatch]) -> [MatchupSummary] {
+        var byDeck: [String: MatchupSummary] = [:]
+        var order: [String] = []
+        for m in matches where m.opponent != nil {
+            if byDeck[m.opponentDeck] == nil {
+                byDeck[m.opponentDeck] = MatchupSummary(deck: m.opponentDeck, icons: m.opponentIcons)
+                order.append(m.opponentDeck)
+            }
+            switch m.result {
+            case .win: byDeck[m.opponentDeck]?.wins += 1
+            case .loss: byDeck[m.opponentDeck]?.losses += 1
+            case .tie: byDeck[m.opponentDeck]?.ties += 1
+            }
+        }
+        return order.compactMap { byDeck[$0] }.sorted {
+            let a = $0.wins + $0.losses + $0.ties, b = $1.wins + $1.losses + $1.ties
+            return a != b ? a > b : $0.deck < $1.deck
+        }
+    }
+}
+
+private struct MatchRow: View {
+    let match: LabsLimitless.LabsMatch
+
+    var body: some View {
+        HStack(spacing: 12) {
+            VStack(spacing: 1) {
+                Text(match.isTopCut ? "TOP" : "R")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(match.isTopCut ? Theme.gold : Theme.muted)
+                Text("\(match.round)")
+                    .font(.subheadline.weight(.bold))
+                    .monospacedDigit()
+                    .foregroundStyle(Theme.ink)
+            }
+            .frame(width: 30)
+            DeckIconView(icons: match.opponentIcons, size: 40)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(match.opponent ?? "Bye")
+                    .font(.body.weight(.semibold))
+                    .foregroundStyle(Theme.ink)
+                    .lineLimit(1)
+                Text(match.opponent == nil ? "Free win" : "\(match.opponentDeck) · \(match.opponentRecord)")
+                    .font(.subheadline)
+                    .foregroundStyle(Theme.muted)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 8)
+            ResultBadge(result: match.result)
+        }
+        .padding(.vertical, 2)
+        .accessibilityElement(children: .combine)
+    }
+}
+
+private struct ResultBadge: View {
+    let result: LabsLimitless.MatchResult
+
+    var body: some View {
+        let (letter, color): (String, Color) = switch result {
+        case .win: ("W", Theme.blue)
+        case .loss: ("L", Theme.red)
+        case .tie: ("T", Theme.silver)
+        }
+        Text(letter)
+            .font(.subheadline.weight(.heavy))
+            .foregroundStyle(.white)
+            .frame(width: 30, height: 30)
+            .background(color, in: .rect(cornerRadius: 8))
+            .accessibilityLabel(result == .win ? "Win" : result == .loss ? "Loss" : "Tie")
     }
 }
 

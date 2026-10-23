@@ -13,8 +13,19 @@ struct TournamentDetailView: View {
     @State private var scope: ResultsScope = .withCard
     @State private var query: String = ""
     @FocusState private var searchFocused: Bool
+    /// Full standings (every player, with or without a decklist), loaded for the All-decks search.
+    @State private var standings: [StandingRow]?
+    @State private var standingsFailed = false
+    @State private var loadingListID: String?
 
     private enum ResultsScope: Hashable { case withCard, all }
+
+    /// A results row: a dataset entry, or a standings-only player when `standing` is set.
+    private struct ResultRow: Identifiable {
+        let entry: PlayerEntry
+        var standing: StandingRow? = nil
+        var id: String { entry.id }
+    }
 
     var body: some View {
         let tournament = model.dataset?.tournament(id: tournamentID)
@@ -26,7 +37,7 @@ struct TournamentDetailView: View {
                     .sorted { ($0.placing ?? Int.max) < ($1.placing ?? Int.max) }
                 let usage = Double(users.count) / Double(max(tournament.entries.count, 1))
                 let everyone = tournament.entries.sorted { ($0.placing ?? Int.max) < ($1.placing ?? Int.max) }
-                let filtered = filter(scope == .withCard ? users : everyone)
+                let filtered = results(scope == .withCard ? users : everyone, tournament: tournament, everyone: everyone)
                 let visible = showAll || !query.isEmpty ? filtered : Array(filtered.prefix(16))
 
                 VStack(alignment: .leading, spacing: 18) {
@@ -103,8 +114,8 @@ struct TournamentDetailView: View {
 
                         if scope == .all {
                             searchField
-                            if tournament.players > everyone.count {
-                                Text("\(everyone.count) of \(tournament.players) players published a decklist.")
+                            if let note = searchNote(tournament: tournament, published: everyone.count) {
+                                Text(note)
                                     .font(.caption)
                                     .foregroundStyle(Theme.muted)
                             }
@@ -119,15 +130,9 @@ struct TournamentDetailView: View {
                                 .multilineTextAlignment(.center)
                                 .frame(maxWidth: .infinity, minHeight: 56)
                         }
-                        ForEach(Array(visible.enumerated()), id: \.element.id) { index, entry in
+                        ForEach(Array(visible.enumerated()), id: \.element.id) { index, row in
                             if index > 0 { Divider().overlay(Theme.hairline).padding(.leading, 56) }
-                            Button {
-                                searchFocused = false
-                                selectedEntry = entry
-                            } label: {
-                                FinisherRow(entry: entry, copies: entry.copies(of: cardKey))
-                            }
-                            .buttonStyle(PressableStyle())
+                            resultRow(row, tournamentID: tournament.id)
                         }
                         if filtered.count > visible.count {
                             Divider().overlay(Theme.hairline)
@@ -176,13 +181,78 @@ struct TournamentDetailView: View {
             reopenEntry = nil
             selectedEntry = entry
         }
+        .task(id: scope) {
+            guard scope == .all, standings == nil, let tournament else { return }
+            standingsFailed = false
+            do { standings = try await TournamentStandings.load(tournament) } catch { standingsFailed = true }
+        }
+    }
+
+    @ViewBuilder
+    private func resultRow(_ row: ResultRow, tournamentID: String) -> some View {
+        let entry = row.entry
+        if let standing = row.standing {
+            if let listID = standing.listID {
+                Button {
+                    searchFocused = false
+                    guard loadingListID == nil else { return }
+                    loadingListID = listID
+                    Task {
+                        let cards = (try? await TournamentStandings.decklist(listID)) ?? []
+                        loadingListID = nil
+                        if !cards.isEmpty { selectedEntry = standing.asEntry(tournamentID: tournamentID, cards: cards) }
+                    }
+                } label: {
+                    FinisherRow(entry: entry, subtitle: loadingListID == listID ? "Loading decklist…" : nil)
+                }
+                .buttonStyle(PressableStyle())
+            } else {
+                FinisherRow(entry: entry, subtitle: "\(entry.deckName) · No decklist", showsChevron: false)
+            }
+        } else {
+            Button {
+                searchFocused = false
+                selectedEntry = entry
+            } label: {
+                FinisherRow(entry: entry, copies: entry.copies(of: cardKey))
+            }
+            .buttonStyle(PressableStyle())
+        }
+    }
+
+    private func searchNote(tournament: TournamentRecord, published: Int) -> String? {
+        if !query.isEmpty && standingsFailed { return "Couldn't load full standings. Searching published decklists only." }
+        if !query.isEmpty && standings == nil { return "Loading all \(tournament.players) players…" }
+        if tournament.players > published {
+            return "\(published) of \(tournament.players) players published a decklist. Search finds any player."
+        }
+        return nil
+    }
+
+    /// Shown rows; while searching All decks, also players from the full standings.
+    private func results(_ entries: [PlayerEntry], tournament: TournamentRecord, everyone: [PlayerEntry]) -> [ResultRow] {
+        let tokens = CardText.key(query).split(separator: " ").map(String.init)
+        let base = entries.map { ResultRow(entry: $0) }
+        guard !tokens.isEmpty else { return base }
+        var pool = base
+        if scope == .all, let standings {
+            let known = Set(everyone.map { "\($0.placing ?? -1)|\(CardText.key($0.name))" })
+            let extras = standings
+                .filter { !known.contains("\($0.placing ?? -1)|\(CardText.key($0.name))") }
+                .map { ResultRow(entry: $0.asEntry(tournamentID: tournament.id), standing: $0) }
+            pool = (base + extras).sorted { ($0.entry.placing ?? Int.max) < ($1.entry.placing ?? Int.max) }
+        }
+        return pool.filter { row in
+            let hay = CardText.key("\(row.entry.name) \(row.entry.deckName)")
+            return tokens.allSatisfy { hay.contains($0) }
+        }
     }
 
     private var searchField: some View {
         HStack(spacing: 8) {
             Image(systemName: "magnifyingglass")
                 .foregroundStyle(Theme.red)
-            TextField("Search player or deck", text: $query)
+            TextField("Search any player or deck", text: $query)
                 .focused($searchFocused)
                 .submitLabel(.search)
                 .autocorrectionDisabled()
@@ -201,16 +271,6 @@ struct TournamentDetailView: View {
         .background(Color(.tertiarySystemFill), in: .rect(cornerRadius: 12))
     }
 
-    /// Entries whose player or deck name contains every word of the search.
-    private func filter(_ entries: [PlayerEntry]) -> [PlayerEntry] {
-        let tokens = CardText.key(query).split(separator: " ").map(String.init)
-        guard !tokens.isEmpty else { return entries }
-        return entries.filter { entry in
-            let hay = CardText.key("\(entry.name) \(entry.deckName)")
-            return tokens.allSatisfy { hay.contains($0) }
-        }
-    }
-
     private func openPendingCard() {
         guard let key = pendingCardKey else { return }
         pendingCardKey = nil
@@ -222,6 +282,7 @@ struct FinisherRow: View {
     let entry: PlayerEntry
     var copies: Int?
     var subtitle: String?
+    var showsChevron: Bool = true
 
     var body: some View {
         HStack(spacing: 12) {
@@ -247,9 +308,11 @@ struct FinisherRow: View {
                 .font(.body.weight(.bold))
                 .monospacedDigit()
                 .foregroundStyle(Theme.ink)
-            Image(systemName: "chevron.right")
-                .font(.footnote.weight(.semibold))
-                .foregroundStyle(Theme.muted.opacity(0.6))
+            if showsChevron {
+                Image(systemName: "chevron.right")
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(Theme.muted.opacity(0.6))
+            }
         }
         .padding(.vertical, 10)
         .contentShape(.rect)

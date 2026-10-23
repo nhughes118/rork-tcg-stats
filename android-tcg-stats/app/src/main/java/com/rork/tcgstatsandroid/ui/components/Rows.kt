@@ -89,7 +89,7 @@ fun TournamentRow(appearance: TournamentAppearance, modifier: Modifier = Modifie
 }
 
 @Composable
-fun FinisherRow(entry: PlayerEntry, modifier: Modifier = Modifier, copies: Int? = null, subtitle: String? = null) {
+fun FinisherRow(entry: PlayerEntry, modifier: Modifier = Modifier, copies: Int? = null, subtitle: String? = null, showChevron: Boolean = true) {
     Row(
         modifier.fillMaxWidth().padding(vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -105,6 +105,6 @@ fun FinisherRow(entry: PlayerEntry, modifier: Modifier = Modifier, copies: Int? 
             }
         }
         Text(entry.recordText, fontSize = 17.sp, fontWeight = FontWeight.Bold, color = Palette.Ink)
-        Chevron()
+        if (showChevron) Chevron()
     }
 }

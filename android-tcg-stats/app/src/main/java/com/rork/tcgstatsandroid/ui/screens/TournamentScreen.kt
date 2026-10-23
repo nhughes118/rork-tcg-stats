@@ -30,6 +30,12 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.material3.VerticalDivider
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.ui.platform.LocalContext
+import kotlinx.coroutines.launch
+import com.rork.tcgstatsandroid.data.StandingRow
+import com.rork.tcgstatsandroid.data.TournamentStandings
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -75,6 +81,21 @@ fun TournamentScreen(vm: AppViewModel, tournamentId: String, cardKey: String, ac
     var scope by rememberSaveable { mutableStateOf(ResultsScope.WithCard) }
     var query by rememberSaveable { mutableStateOf("") }
     val uriHandler = LocalUriHandler.current
+    val context = LocalContext.current
+    val coroutines = rememberCoroutineScope()
+    // Full standings (every player, with or without a decklist), loaded for the All-decks search.
+    var standings by remember(tournamentId) { mutableStateOf<List<StandingRow>?>(null) }
+    var standingsFailed by remember(tournamentId) { mutableStateOf(false) }
+    var extraEntry by remember { mutableStateOf<PlayerEntry?>(null) }
+    var loadingListId by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(tournament, scope) {
+        val t = tournament ?: return@LaunchedEffect
+        if (scope != ResultsScope.All || standings != null) return@LaunchedEffect
+        standingsFailed = false
+        runCatching { TournamentStandings.load(context, t) }
+            .onSuccess { standings = it }
+            .onFailure { standingsFailed = true }
+    }
 
     CanvasBackground(modifier) {
         Column(Modifier.fillMaxSize()) {
@@ -96,11 +117,21 @@ fun TournamentScreen(vm: AppViewModel, tournamentId: String, cardKey: String, ac
             }
             val usage = users.size.toDouble() / maxOf(tournament.entries.size, 1)
             val everyone = remember(tournament) { tournament.entries.sortedBy { it.placing ?: Int.MAX_VALUE } }
-            val base = if (scope == ResultsScope.WithCard) users else everyone
-            val filtered = remember(base, query) {
+            // Standings rows for players whose decklist isn't among the shown entries.
+            val extras = remember(tournament, standings) {
+                val known = everyone.map { "${it.placing}|${CardText.key(it.name)}" }.toHashSet()
+                standings.orEmpty()
+                    .filter { "${it.placing}|${CardText.key(it.name)}" !in known }
+                    .map { ResultRow(it.asEntry(tournament.id), it) }
+            }
+            val base = if (scope == ResultsScope.WithCard) users.map { ResultRow(it) } else everyone.map { ResultRow(it) }
+            val filtered = remember(base, extras, query, scope) {
                 val tokens = CardText.key(query).split(" ").filter { it.isNotEmpty() }
                 if (tokens.isEmpty()) base
-                else base.filter { e -> val hay = CardText.key("${e.name} ${e.deckName}"); tokens.all { hay.contains(it) } }
+                else {
+                    val pool = if (scope == ResultsScope.All) (base + extras).sortedBy { it.entry.placing ?: Int.MAX_VALUE } else base
+                    pool.filter { r -> val hay = CardText.key("${r.entry.name} ${r.entry.deckName}"); tokens.all { hay.contains(it) } }
+                }
             }
             val visible = if (showAll || query.isNotBlank()) filtered else filtered.take(16)
 
@@ -165,12 +196,14 @@ fun TournamentScreen(vm: AppViewModel, tournamentId: String, cardKey: String, ac
                     )
                     if (scope == ResultsScope.All) {
                         ResultsSearchField(query, onQuery = { query = it })
-                        if (tournament.players > everyone.size) {
-                            Text(
-                                "${everyone.size} of ${tournament.players} players published a decklist.",
-                                fontSize = 12.sp, color = Palette.Muted,
-                            )
+                        val note = when {
+                            query.isNotBlank() && standingsFailed -> "Couldn't load full standings. Searching published decklists only."
+                            query.isNotBlank() && standings == null -> "Loading all ${tournament.players} players…"
+                            tournament.players > everyone.size ->
+                                "${everyone.size} of ${tournament.players} players published a decklist. Search finds any player."
+                            else -> null
                         }
+                        note?.let { Text(it, fontSize = 12.sp, color = Palette.Muted) }
                     }
                 }
 
@@ -178,9 +211,33 @@ fun TournamentScreen(vm: AppViewModel, tournamentId: String, cardKey: String, ac
                     if (visible.isEmpty()) {
                         EmptyRow(if (query.isNotBlank()) "No player or deck matches “$query”." else "No decklists for this event.")
                     }
-                    visible.forEachIndexed { index, entry ->
+                    visible.forEachIndexed { index, row ->
                         if (index > 0) RowDivider(start = 56.dp)
-                        FinisherRow(entry, Modifier.pressable { selectedId = entry.id }, copies = entry.copies(cardKey))
+                        val entry = row.entry
+                        val standing = row.standing
+                        if (standing == null) {
+                            FinisherRow(entry, Modifier.pressable { selectedId = entry.id }, copies = entry.copies(cardKey))
+                        } else {
+                            val listId = standing.listId
+                            if (listId == null) {
+                                FinisherRow(entry, subtitle = "${entry.deckName} · No decklist", showChevron = false)
+                            } else {
+                                FinisherRow(
+                                    entry,
+                                    Modifier.pressable {
+                                        if (loadingListId != null) return@pressable
+                                        loadingListId = listId
+                                        coroutines.launch {
+                                            val cards = runCatching { TournamentStandings.decklist(listId) }.getOrNull().orEmpty()
+                                            loadingListId = null
+                                            if (cards.isNotEmpty()) extraEntry = standing.asEntry(tournament.id, cards)
+                                        }
+                                    },
+                                    copies = null,
+                                    subtitle = if (loadingListId == listId) "Loading decklist…" else entry.deckName,
+                                )
+                            }
+                        }
                     }
                     if (filtered.size > visible.size) {
                         RowDivider()
@@ -214,9 +271,15 @@ fun TournamentScreen(vm: AppViewModel, tournamentId: String, cardKey: String, ac
     selected?.let { entry ->
         DecklistSheet(entry, highlightKey = cardKey, tournamentName = tournament?.name, onOpenCard = actions.openCard, onDismiss = { selectedId = null })
     }
+    extraEntry?.let { entry ->
+        DecklistSheet(entry, highlightKey = cardKey, tournamentName = tournament?.name, onOpenCard = actions.openCard, onDismiss = { extraEntry = null })
+    }
 }
 
 private enum class ResultsScope { WithCard, All }
+
+/** A results row: a dataset entry, or a standings-only player when [standing] is set. */
+private data class ResultRow(val entry: PlayerEntry, val standing: StandingRow? = null)
 
 @Composable
 private fun ResultsSearchField(query: String, onQuery: (String) -> Unit) {
@@ -231,7 +294,7 @@ private fun ResultsSearchField(query: String, onQuery: (String) -> Unit) {
         Icon(Icons.Filled.Search, contentDescription = null, tint = Palette.Red, modifier = Modifier.size(20.dp))
         Spacer(Modifier.width(8.dp))
         Box(Modifier.weight(1f)) {
-            if (query.isEmpty()) Text("Search player or deck", fontSize = 16.sp, color = Palette.Muted)
+            if (query.isEmpty()) Text("Search any player or deck", fontSize = 16.sp, color = Palette.Muted)
             BasicTextField(
                 value = query,
                 onValueChange = onQuery,

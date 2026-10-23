@@ -145,9 +145,6 @@ nonisolated enum LimitlessClient {
 
     // MARK: Official via Limitless Labs (full standings + every player's decklist)
 
-    /// Parallel decklist requests against Limitless Labs.
-    static let labsConcurrency = 24
-
     /// Shares identical card lines across decklists; full events hold thousands of near-identical lists.
     private static func intern(_ records: [TournamentRecord]) -> [TournamentRecord] {
         var cards: [DeckCard: DeckCard] = [:]
@@ -165,41 +162,82 @@ nonisolated enum LimitlessClient {
         }
     }
 
-    private static func labsRecord(_ t: LabsLimitless.LabsTournament, progress: @escaping @Sendable (Int, Int) -> Void) async throws -> TournamentRecord? {
-        let recordID = LabsLimitless.idPrefix + t.id
-        let summary = TournamentSummary(id: recordID, name: t.name, date: t.date, players: 0)
-        if let cached = cachedRecord(summary, .official) { return cached }
-        let standings = try await LabsLimitless.standings(t.id)
-        guard !standings.isEmpty else { return nil }
-        let withLists = standings.filter(\.hasList)
+    private static func loadLabs(progress: @escaping @Sendable (Double) -> Void) async -> [TournamentRecord] {
+        let now = Date()
+        progress(0.02)
+        let oldest = now.addingTimeInterval(-Double(weeksBack) * 7 * 86_400)
+        guard let all = try? await LabsLimitless.tournaments() else { return [] }
+        let selected = Array(all
+            .filter { $0.completed && $0.date >= oldest && $0.date <= now }
+            .sorted { $0.date > $1.date }
+            .prefix(officialMaxEvents))
+        guard !selected.isEmpty else { return [] }
 
-        var lists: [Int: [DeckCard]] = [:]
-        var done = 0
-        var failed = 0
-        await withTaskGroup(of: (Int, [DeckCard]?).self) { group in
-            var iterator = withLists.makeIterator()
-            func addNext() {
-                guard let s = iterator.next() else { return }
+        // Cached events decode in parallel; only the rest touch the network.
+        var cached = [TournamentRecord?](repeating: nil, count: selected.count)
+        await withTaskGroup(of: (Int, TournamentRecord?).self) { group in
+            for (i, t) in selected.enumerated() {
                 group.addTask {
-                    for _ in 0..<3 {
-                        if let cards = try? await LabsLimitless.decklist(t.id, tpID: s.tpID) { return (s.tpID, cards) }
-                    }
-                    return (s.tpID, nil)
+                    let summary = TournamentSummary(id: LabsLimitless.idPrefix + t.id, name: t.name, date: t.date, players: 0)
+                    return (i, cachedRecord(summary, .official))
                 }
             }
-            for _ in 0..<labsConcurrency { addNext() }
-            for await (tp, cards) in group {
+            for await (i, record) in group { cached[i] = record }
+        }
+        let pending = selected.indices.filter { cached[$0] == nil }.map { selected[$0] }
+        progress(0.05)
+
+        // All standings at once, then one shared pool of decklist requests across every event,
+        // so the connection stays saturated instead of draining at the end of each event.
+        var standings = [[LabsLimitless.LabsStanding]](repeating: [], count: pending.count)
+        await withTaskGroup(of: (Int, [LabsLimitless.LabsStanding]).self) { group in
+            for (i, t) in pending.enumerated() {
+                group.addTask { (i, (try? await LabsLimitless.standings(t.id)) ?? []) }
+            }
+            for await (i, list) in group { standings[i] = list }
+        }
+        progress(0.08)
+
+        let jobs: [(event: Int, standing: LabsLimitless.LabsStanding)] = pending.indices.flatMap { i in
+            standings[i].filter(\.hasList).map { (i, $0) }
+        }
+        var lists = [[DeckCard]?](repeating: nil, count: jobs.count)
+        var failed = [Int](repeating: 0, count: pending.count)
+        var done = 0
+        await withTaskGroup(of: (Int, [DeckCard]?).self) { group in
+            var next = 0
+            func addNext() {
+                guard next < jobs.count else { return }
+                let j = next
+                next += 1
+                let tid = pending[jobs[j].event].id
+                let tp = jobs[j].standing.tpID
+                group.addTask {
+                    for attempt in 0..<3 {
+                        if let cards = try? await LabsLimitless.decklist(tid, tpID: tp) { return (j, cards) }
+                        try? await Task.sleep(for: .milliseconds(250 * (attempt + 1)))
+                    }
+                    return (j, nil)
+                }
+            }
+            for _ in 0..<LabsLimitless.concurrency { addNext() }
+            for await (j, cards) in group {
                 done += 1
-                progress(done, withLists.count)
-                if let cards { if !cards.isEmpty { lists[tp] = cards } } else { failed += 1 }
+                if let cards { lists[j] = cards } else { failed[jobs[j].event] += 1 }
+                if done % 16 == 0 || done == jobs.count { progress(0.08 + 0.92 * Double(done) / Double(jobs.count)) }
                 addNext()
             }
         }
 
-        let entries: [PlayerEntry] = withLists.compactMap { s in
-            guard let cards = lists[s.tpID] else { return nil }
-            return PlayerEntry(
-                id: "\(recordID)-\(s.tpID)",
+        var fresh = [TournamentRecord?](repeating: nil, count: pending.count)
+        var jobsPerEvent = [Int](repeating: 0, count: pending.count)
+        var entriesPerEvent = [[PlayerEntry]](repeating: [], count: pending.count)
+        for (j, job) in jobs.enumerated() {
+            jobsPerEvent[job.event] += 1
+            guard let cards = lists[j], !cards.isEmpty else { continue }
+            let s = job.standing
+            entriesPerEvent[job.event].append(PlayerEntry(
+                id: "\(LabsLimitless.idPrefix)\(pending[job.event].id)-\(s.tpID)",
                 name: s.name,
                 placing: s.placing,
                 wins: s.wins,
@@ -209,36 +247,22 @@ nonisolated enum LimitlessClient {
                 deckIcons: s.icons,
                 cards: cards,
                 cardKeys: Set(cards.map(\.key))
-            )
+            ))
         }
-        guard !entries.isEmpty else { return nil }
-        let record = TournamentRecord(id: recordID, name: t.name, date: t.date, players: standings.count, entries: entries, source: .official)
-        // Cache only (nearly) complete events so a flaky load is retried next time.
-        if failed <= withLists.count / 50 { saveCache(record) }
-        return record
-    }
-
-    private static func loadLabs(progress: @escaping @Sendable (Double) -> Void) async -> [TournamentRecord] {
-        let now = Date()
-        progress(0.02)
-        let oldest = now.addingTimeInterval(-Double(weeksBack) * 7 * 86_400)
-        guard let all = try? await LabsLimitless.tournaments() else { return [] }
-        let selected = all
-            .filter { $0.completed && $0.date >= oldest && $0.date <= now }
-            .sorted { $0.date > $1.date }
-            .prefix(officialMaxEvents)
-        guard !selected.isEmpty else { return [] }
-        var records: [TournamentRecord] = []
-        let count = Double(selected.count)
-        for (index, t) in selected.enumerated() {
-            let base = 0.04 + 0.96 * Double(index) / count
-            let record = try? await labsRecord(t) { done, total in
-                progress(base + 0.96 / count * Double(done) / Double(max(total, 1)))
-            }
-            if let record { records.append(record) }
-            progress(0.04 + 0.96 * Double(index + 1) / count)
+        for (i, t) in pending.enumerated() where !entriesPerEvent[i].isEmpty {
+            let record = TournamentRecord(id: LabsLimitless.idPrefix + t.id, name: t.name, date: t.date,
+                                          players: standings[i].count, entries: entriesPerEvent[i], source: .official)
+            // Cache only (nearly) complete events so a flaky load is retried next time.
+            if failed[i] <= jobsPerEvent[i] / 50 { saveCache(record) }
+            fresh[i] = record
         }
-        return records
+        progress(1.0)
+        var p = 0
+        return selected.indices.compactMap { i in
+            if let c = cached[i] { return c }
+            defer { p += 1 }
+            return fresh[p]
+        }
     }
 
     private static func loadOfficial(progress: @escaping @Sendable (Double) -> Void) async throws -> CardDataset {

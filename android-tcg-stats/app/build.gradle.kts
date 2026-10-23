@@ -65,6 +65,7 @@ dependencies {
     implementation(libs.ktor.serialization.json)
     implementation(libs.coil.compose)
     implementation(libs.coil.network.okhttp)
+    implementation(libs.okhttp)
     implementation(libs.koin.androidx.compose)
     implementation(libs.camerax.core)
     implementation(libs.camerax.camera2)

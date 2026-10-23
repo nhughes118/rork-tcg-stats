@@ -5,6 +5,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
@@ -38,8 +39,6 @@ object LimitlessClient {
     const val OFFICIAL_LIST_LIMIT = 64
     /** Maximum official events (homepage recent + older completed) per load. */
     private const val OFFICIAL_MAX_EVENTS = 8
-    /** Parallel decklist requests against Limitless Labs. */
-    private const val LABS_CONCURRENCY = 24
 
     private const val BAD_RESPONSE = "Limitless TCG didn't respond as expected. Please try again."
     private const val NO_DATA = "No recent tournament decklists were found."
@@ -60,9 +59,11 @@ object LimitlessClient {
             conn.setRequestProperty("Accept", accept)
             userAgent?.let { conn.setRequestProperty("User-Agent", it) }
             if (conn.responseCode !in 200..299) throw LimitlessException(BAD_RESPONSE)
+            // Reading to the end and closing (not disconnecting) returns the socket to the keep-alive pool.
             conn.inputStream.bufferedReader().use { it.readText() }
-        } finally {
+        } catch (e: Exception) {
             conn.disconnect()
+            throw e
         }
     }
 
@@ -191,45 +192,7 @@ object LimitlessClient {
         }
     }
 
-    private suspend fun labsRecord(context: Context, t: LabsLimitless.LabsTournament, progress: (Int, Int) -> Unit): TournamentRecord? {
-        val recordId = LabsLimitless.ID_PREFIX + t.id
-        cachedRecord(context, recordId, DataSource.Official)?.let { return it }
-        val standings = LabsLimitless.standings(t.id)
-        if (standings.isEmpty()) return null
-        val withLists = standings.filter { it.hasList }
-        val done = AtomicInteger(0)
-        val failed = AtomicInteger(0)
-        val entries = withLists.mapConcurrent(LABS_CONCURRENCY) { s ->
-            var cards: List<DeckCard>? = null
-            for (attempt in 0 until 3) {
-                cards = runCatching { LabsLimitless.decklist(t.id, s.tpId) }.getOrNull()
-                if (cards != null) break
-            }
-            progress(done.incrementAndGet(), withLists.size)
-            if (cards == null) failed.incrementAndGet()
-            val list = cards.orEmpty()
-            if (list.isEmpty()) return@mapConcurrent null
-            PlayerEntry(
-                id = "$recordId-${s.tpId}",
-                name = s.name,
-                placing = s.placing,
-                wins = s.wins,
-                losses = s.losses,
-                ties = s.ties,
-                deckName = s.deckName,
-                deckIcons = s.icons,
-                cards = list,
-                cardKeys = list.map { it.key }.toSet(),
-            )
-        }.filterNotNull()
-        if (entries.isEmpty()) return null
-        val record = TournamentRecord(recordId, t.name, t.date, standings.size, entries, DataSource.Official)
-        // Cache only (nearly) complete events so a flaky load is retried next time.
-        if (failed.get() <= withLists.size / 50) saveCache(context, record)
-        return record
-    }
-
-    private suspend fun loadLabs(context: Context, progress: (Double) -> Unit): List<TournamentRecord> {
+    private suspend fun loadLabs(context: Context, progress: (Double) -> Unit): List<TournamentRecord> = coroutineScope {
         val now = System.currentTimeMillis()
         progress(0.02)
         val oldest = now - WEEKS_BACK * Weeks.WEEK
@@ -237,18 +200,66 @@ object LimitlessClient {
             .filter { it.completed && it.date in oldest..now }
             .sortedByDescending { it.date }
             .take(OFFICIAL_MAX_EVENTS)
-        if (selected.isEmpty()) return emptyList()
-        // Progress is split evenly per event; each event reports its decklists.
-        val records = mutableListOf<TournamentRecord>()
-        selected.forEachIndexed { index, t ->
-            val base = 0.04 + 0.96 * index / selected.size
-            val record = runCatching {
-                labsRecord(context, t) { done, total -> progress(base + 0.96 / selected.size * done / maxOf(total, 1)) }
-            }.getOrNull()
-            if (record != null) records += record
-            progress(0.04 + 0.96 * (index + 1) / selected.size)
+        if (selected.isEmpty()) return@coroutineScope emptyList()
+
+        // Cached events decode in parallel; only the rest touch the network.
+        val cached = selected.mapConcurrent(4) { t -> cachedRecord(context, LabsLimitless.ID_PREFIX + t.id, DataSource.Official) }
+        val pending = selected.filterIndexed { i, _ -> cached[i] == null }
+        progress(0.05)
+
+        // All standings at once, then one shared pool of decklist requests across every event,
+        // so the connection stays saturated instead of draining at the end of each event.
+        val standings = pending.mapConcurrent(pending.size.coerceAtLeast(1)) { t ->
+            runCatching { LabsLimitless.standings(t.id) }.getOrElse { emptyList() }
         }
-        return records
+        progress(0.08)
+        val jobs = pending.indices.flatMap { i -> standings[i].filter { it.hasList }.map { i to it } }
+        val done = AtomicInteger(0)
+        val failed = IntArray(pending.size)
+        val lists = jobs.mapConcurrent(LabsLimitless.CONCURRENCY) { (i, s) ->
+            var cards: List<DeckCard>? = null
+            for (attempt in 0 until 3) {
+                cards = runCatching { LabsLimitless.decklist(pending[i].id, s.tpId) }.getOrNull()
+                if (cards != null) break
+                kotlinx.coroutines.delay(250L * (attempt + 1))
+            }
+            if (cards == null) synchronized(failed) { failed[i]++ }
+            val n = done.incrementAndGet()
+            if (n % 16 == 0 || n == jobs.size) progress(0.08 + 0.92 * n / jobs.size)
+            cards.orEmpty()
+        }
+
+        val fresh = arrayOfNulls<TournamentRecord>(pending.size)
+        val byEvent = jobs.indices.groupBy { jobs[it].first }
+        for ((i, t) in pending.withIndex()) {
+            val recordId = LabsLimitless.ID_PREFIX + t.id
+            val indices = byEvent[i].orEmpty()
+            val entries = indices.mapNotNull { j ->
+                val s = jobs[j].second
+                val cards = lists[j]
+                if (cards.isEmpty()) return@mapNotNull null
+                PlayerEntry(
+                    id = "$recordId-${s.tpId}",
+                    name = s.name,
+                    placing = s.placing,
+                    wins = s.wins,
+                    losses = s.losses,
+                    ties = s.ties,
+                    deckName = s.deckName,
+                    deckIcons = s.icons,
+                    cards = cards,
+                    cardKeys = cards.map { it.key }.toSet(),
+                )
+            }
+            if (entries.isEmpty()) continue
+            val record = TournamentRecord(recordId, t.name, t.date, standings[i].size, entries, DataSource.Official)
+            // Cache only (nearly) complete events so a flaky load is retried next time.
+            if (failed[i] <= indices.size / 50) launch(Dispatchers.IO) { saveCache(context, record) }
+            fresh[i] = record
+        }
+        progress(1.0)
+        var p = 0
+        selected.indices.mapNotNull { i -> cached[i] ?: fresh[p++] }
     }
 
     // Official fallback (limitlesstcg.com scraping, top finishers only)

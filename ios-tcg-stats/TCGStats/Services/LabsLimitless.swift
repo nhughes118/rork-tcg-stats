@@ -6,6 +6,19 @@ import Foundation
 nonisolated enum LabsLimitless {
     static let api = "https://mew.limitlesstcg.com/labs/data/tcg"
     static let idPrefix = "labs-"
+    /// Requests in flight at once; HTTP/2 multiplexes them over a single connection.
+    static let concurrency = 64
+
+    /// Dedicated session: HTTP/2, kept-alive connection, no URL cache churn for thousands of small responses.
+    private static let session: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.httpMaximumConnectionsPerHost = 8
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        config.urlCache = nil
+        config.timeoutIntervalForRequest = 30
+        config.waitsForConnectivity = false
+        return URLSession(configuration: config)
+    }()
 
     struct LabsTournament: Sendable {
         let id: String
@@ -114,7 +127,7 @@ nonisolated enum LabsLimitless {
         var request = URLRequest(url: url)
         request.timeoutInterval = 30
         request.setValue("application/json", forHTTPHeaderField: "Accept")
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
             throw LimitlessError.badResponse
         }

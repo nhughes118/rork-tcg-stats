@@ -1,6 +1,17 @@
 package com.rork.tcgstatsandroid.data
 
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.serialization.json.JsonArray
+import okhttp3.Call
+import okhttp3.Callback
+import okhttp3.Dispatcher
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.Response
+import java.io.IOException
+import java.util.concurrent.TimeUnit
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
@@ -17,6 +28,44 @@ import java.util.TimeZone
 object LabsLimitless {
     private const val API = "https://mew.limitlesstcg.com/labs/data/tcg"
     const val ID_PREFIX = "labs-"
+    /** Requests in flight at once; HTTP/2 multiplexes them over a single connection. */
+    const val CONCURRENCY = 64
+
+    /** One shared client: HTTP/2, kept-alive connection, transparent gzip. */
+    private val client: OkHttpClient by lazy {
+        OkHttpClient.Builder()
+            .dispatcher(Dispatcher().apply { maxRequests = CONCURRENCY; maxRequestsPerHost = CONCURRENCY })
+            .connectTimeout(20, TimeUnit.SECONDS)
+            .readTimeout(30, TimeUnit.SECONDS)
+            .retryOnConnectionFailure(true)
+            .build()
+    }
+
+    private suspend fun fetch(url: String): String = suspendCancellableCoroutine { cont ->
+        val call = client.newCall(
+            Request.Builder().url(url)
+                .header("Accept", "application/json")
+                .header("User-Agent", OfficialLimitless.USER_AGENT)
+                .build()
+        )
+        cont.invokeOnCancellation { call.cancel() }
+        call.enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                if (cont.isActive) cont.resumeWithException(e)
+            }
+
+            override fun onResponse(call: Call, response: Response) {
+                response.use {
+                    val body = runCatching { it.body?.string() }.getOrNull()
+                    when {
+                        !cont.isActive -> Unit
+                        it.isSuccessful && body != null -> cont.resume(body)
+                        else -> cont.resumeWithException(LimitlessException("Limitless Labs returned ${it.code}."))
+                    }
+                }
+            }
+        })
+    }
 
     data class LabsTournament(val id: String, val name: String, val date: Long, val completed: Boolean)
 
@@ -94,7 +143,7 @@ object LabsLimitless {
     }
 
     private suspend fun get(path: String): Any? {
-        val text = LimitlessClient.httpGet("$API/$path", "application/json", OfficialLimitless.USER_AGENT)
+        val text = fetch("$API/$path")
         val root = LimitlessClient.json.parseToJsonElement(text) as? JsonObject ?: return null
         if ((root["ok"] as? JsonPrimitive)?.contentOrNull != "true") return null
         return root["message"]

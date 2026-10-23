@@ -57,6 +57,16 @@ enum class Division(val slug: String, val label: String) {
     val league: String get() = slug.removePrefix("tcg-")
 }
 
+/** Play! Pokémon rating zones. Each zone has its own leaderboard with region-specific ranks. */
+enum class LeaderboardRegion(val zone: String, val label: String) {
+    Global("All", "Global"),
+    NorthAmerica("REGION-NA", "US & Canada"),
+    Europe("REGION-EU", "Europe"),
+    LatinAmerica("REGION-LA", "Latin America"),
+    Oceania("REGION-AP", "Oceania"),
+    MiddleEast("REGION-SO", "Middle East & S. Africa");
+}
+
 @Serializable
 data class LeaderboardPlayer(
     val rank: Int,
@@ -78,6 +88,8 @@ data class LeaderboardIndex(
     val players: List<LeaderboardPlayer>,
     /** Season label shown in the UI, e.g. "2026". */
     val season: String? = null,
+    /** Zone of [LeaderboardRegion] this index was built for. */
+    val region: String = LeaderboardRegion.Global.zone,
 )
 
 /** A Championship Points season as listed in the leaderboard page's season picker. */
@@ -123,6 +135,14 @@ object Leaderboard {
         val describe: String get() = url(1, null)
         fun param(name: String) = params.firstOrNull { it.first == name }?.second
 
+        /** Same request with `zone` set to [zone] (added if the original had none). */
+        fun withZone(zone: String): Template {
+            val items = params.filter { it.first != "zone" }.toMutableList()
+            val at = items.indexOfFirst { it.first == "include" || it.first == "format" }.takeIf { it >= 0 } ?: items.size
+            items.add(at, "zone" to zone)
+            return Template(base, items)
+        }
+
         companion object {
             private fun enc(s: String) = URLEncoder.encode(s, "UTF-8")
             fun parse(url: String): Template? = runCatching {
@@ -135,9 +155,9 @@ object Leaderboard {
     }
 
     /** Request URLs to try, best first: the page's own request, then ones rebuilt from its dropdown values. */
-    private fun templates(division: Division, setup: PageSetup): List<Template> {
+    private fun templates(division: Division, region: LeaderboardRegion, setup: PageSetup): List<Template> {
         val out = ArrayList<Template>()
-        setup.capturedUrl?.let { Template.parse(it) }?.let { out += it }
+        setup.capturedUrl?.let { Template.parse(it) }?.let { out += it.withZone(region.zone) }
         val type = setup.type ?: "championship"
         val whenId = setup.whenId ?: FALLBACK_SEASON.id
         fun build(product: Boolean, season: String?): Template {
@@ -145,7 +165,7 @@ object Leaderboard {
             if (season != null) items += "leaderboard_when" to season
             items += "leaderboard_who" to ""
             if (product) { items += "product" to "tcg"; items += "league" to division.league }
-            setup.zone?.takeIf { it.isNotEmpty() && it != "All" }?.let { items += "zone" to it }
+            items += "zone" to region.zone
             items += "include" to "metadata"
             items += "format" to "json"
             return Template("$API${division.slug}/", items)
@@ -158,21 +178,24 @@ object Leaderboard {
 
     // ---------- Cache ----------
 
-    private fun cacheFile(context: Context, division: Division) =
-        File(context.filesDir, "leaderboard").apply { mkdirs() }.let { File(it, "${division.slug}-v3.json") }
+    private fun cacheFile(context: Context, division: Division, region: LeaderboardRegion): File {
+        val suffix = if (region == LeaderboardRegion.Global) "" else "-${region.zone.lowercase(Locale.US)}"
+        return File(context.filesDir, "leaderboard").apply { mkdirs() }.let { File(it, "${division.slug}$suffix-v3.json") }
+    }
 
-    suspend fun cached(context: Context, division: Division): LeaderboardIndex? = withContext(Dispatchers.IO) {
-        val file = cacheFile(context, division)
+    suspend fun cached(context: Context, division: Division, region: LeaderboardRegion): LeaderboardIndex? = withContext(Dispatchers.IO) {
+        val file = cacheFile(context, division, region)
         if (!file.exists()) return@withContext null
         runCatching { LimitlessClient.json.decodeFromString(LeaderboardIndex.serializer(), file.readText()) }.getOrNull()
+            ?.takeIf { it.division == division.slug && it.region == region.zone }
     }
 
     fun isFresh(index: LeaderboardIndex): Boolean =
         index.complete && System.currentTimeMillis() - index.fetchedAt < CACHE_TTL_MS
 
-    private suspend fun save(context: Context, division: Division, index: LeaderboardIndex) = withContext(Dispatchers.IO) {
+    private suspend fun save(context: Context, division: Division, region: LeaderboardRegion, index: LeaderboardIndex) = withContext(Dispatchers.IO) {
         runCatching {
-            val file = cacheFile(context, division)
+            val file = cacheFile(context, division, region)
             val tmp = File(file.parentFile, file.name + ".tmp")
             tmp.writeText(LimitlessClient.json.encodeToString(LeaderboardIndex.serializer(), index))
             tmp.renameTo(file)
@@ -193,6 +216,7 @@ object Leaderboard {
     suspend fun load(
         activity: Activity,
         division: Division,
+        region: LeaderboardRegion,
         onProgress: suspend (List<LeaderboardPlayer>, Int) -> Unit,
     ): LeaderboardIndex {
         val web = WebFetcher(activity)
@@ -229,7 +253,7 @@ object Leaderboard {
             var first: Page? = null
             var chosen: Pair<Template, Int?>? = null
             var responded = false
-            probe@ for (template in templates(division, setup)) {
+            probe@ for (template in templates(division, region, setup)) {
                 // The site's own picker tops out at 100 rows; larger sizes come back empty, so never trust those.
                 val sizes: List<Int?> = listOf(REQUESTED_PER_PAGE, null)
                 for (size in sizes) {
@@ -247,7 +271,7 @@ object Leaderboard {
             }
             if (first == null || chosen == null) {
                 throw LeaderboardException(
-                    if (responded) "The ${division.label} leaderboard came back empty (page ${if (setup.capturedUrl == null) "sent no request" else "request seen"}, season ${setup.whenLabel ?: "?"})."
+                    if (responded) "The ${division.label} ${if (region == LeaderboardRegion.Global) "" else "${region.label} "}leaderboard came back empty (page ${if (setup.capturedUrl == null) "sent no request" else "request seen"}, season ${setup.whenLabel ?: "?"})."
                     else "Pokémon's leaderboard didn't respond. It may be limiting requests, so try again in a minute."
                 )
             }
@@ -288,9 +312,10 @@ object Leaderboard {
                 complete = failed.get() == 0,
                 players = players,
                 season = seasonLabel,
+                region = region.zone,
             )
             Log.d("Leaderboard", "${division.slug}: indexed ${players.size}/$total (failed pages ${failed.get()})")
-            save(activity.applicationContext, division, index)
+            save(activity.applicationContext, division, region, index)
             return index
         } finally {
             web.close()

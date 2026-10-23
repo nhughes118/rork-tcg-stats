@@ -16,6 +16,7 @@ final class PlayersModel {
         }
     }
     private(set) var division: Division = Division(rawValue: UserDefaults.standard.string(forKey: Keys.division) ?? "") ?? .masters
+    private(set) var region: LeaderboardRegion = LeaderboardRegion(rawValue: UserDefaults.standard.string(forKey: Keys.region) ?? "") ?? .global
     private(set) var sync: Sync = .idle
     private(set) var players: [LeaderboardPlayer] = []
     private(set) var total = 0
@@ -32,12 +33,16 @@ final class PlayersModel {
     private enum Keys {
         static let query = "players_query"
         static let division = "players_division"
+        static let region = "players_region"
         static let meName = "players_me_name"
         static let meDivision = "players_me_division"
         static let meRank = "players_me_rank"
     }
 
     var isLoading: Bool { if case .loading = sync { true } else { false } }
+
+    /// Identifies the board on screen; changes whenever division or region does.
+    var boardID: String { "\(division.rawValue)|\(region.rawValue)" }
 
     private func apply(_ list: [LeaderboardPlayer], total: Int) async {
         let norms = await Task.detached(priority: .userInitiated) { list.map { Leaderboard.normalize($0.name) } }.value
@@ -50,9 +55,20 @@ final class PlayersModel {
 
     func setDivision(_ d: Division) {
         guard d != division else { return }
-        loadTask?.cancel()
         division = d
         UserDefaults.standard.set(d.rawValue, forKey: Keys.division)
+        resetBoard()
+    }
+
+    func setRegion(_ r: LeaderboardRegion) {
+        guard r != region else { return }
+        region = r
+        UserDefaults.standard.set(r.rawValue, forKey: Keys.region)
+        resetBoard()
+    }
+
+    private func resetBoard() {
+        loadTask?.cancel()
         cacheIndex = nil
         normalized = []
         players = []
@@ -66,7 +82,8 @@ final class PlayersModel {
     /// Shows the cached index right away and refreshes it if it's stale.
     func ensureLoaded() async {
         let d = division
-        if cacheIndex == nil, let cached = await Leaderboard.cached(d), d == division {
+        let r = region
+        if cacheIndex == nil, let cached = await Leaderboard.cached(d, r), d == division, r == region {
             cacheIndex = cached
             season = cached.season
             await apply(cached.players, total: cached.total)
@@ -79,21 +96,23 @@ final class PlayersModel {
     func refresh() {
         loadTask?.cancel()
         let d = division
+        let r = region
+        let board = boardID
         let hadPlayers = !players.isEmpty
         sync = .loading(loaded: 0, total: total)
         loadTask = Task { [weak self] in
             let throttle = Throttle()
             do {
-                let index = try await Leaderboard.load(d) { collected, total in
+                let index = try await Leaderboard.load(d, region: r) { collected, total in
                     let emit = await throttle.shouldEmit(done: collected.count >= total)
                     let sorted = (!hadPlayers && emit) ? collected.sorted { $0.rank < $1.rank } : nil
                     await MainActor.run {
-                        guard let self, self.division == d, !Task.isCancelled else { return }
+                        guard let self, self.boardID == board, !Task.isCancelled else { return }
                         self.sync = .loading(loaded: collected.count, total: total)
                         if let sorted { Task { await self.apply(sorted, total: total) } }
                     }
                 }
-                guard let self, !Task.isCancelled, self.division == d else { return }
+                guard let self, !Task.isCancelled, self.boardID == board else { return }
                 self.cacheIndex = index
                 self.season = index.season
                 await self.apply(index.players, total: index.total)
@@ -101,7 +120,7 @@ final class PlayersModel {
             } catch is CancellationError {
                 return
             } catch {
-                guard let self, !Task.isCancelled, self.division == d else { return }
+                guard let self, !Task.isCancelled, self.boardID == board else { return }
                 let message = (error as? LeaderboardError)?.message ?? "Couldn't load the leaderboard. Check your connection and try again."
                 if !self.players.isEmpty, let cached = self.cacheIndex {
                     self.sync = .ready(cached.fetchedAt, complete: cached.complete)
@@ -225,7 +244,7 @@ struct PlayersView: View {
             .scrollDismissesKeyboard(.interactively)
             .background { CanvasBackground() }
             .navigationTitle("Players")
-            .task(id: model.division) { await model.ensureLoaded() }
+            .task(id: model.boardID) { await model.ensureLoaded() }
             .sensoryFeedback(.selection, trigger: selected)
             .sheet(item: $selected) { player in
                 PlayerDetailSheet(
@@ -233,6 +252,7 @@ struct PlayersView: View {
                     players: model.players,
                     total: model.total,
                     division: model.division,
+                    region: model.region,
                     isMe: model.isMe(player),
                     onToggleMe: { model.toggleMe(player) }
                 )
@@ -278,11 +298,43 @@ struct PlayersView: View {
             .pickerStyle(.segmented)
             .sensoryFeedback(.selection, trigger: model.division)
 
+            regionChips
+
             syncLine
         }
         .padding(14)
         .cardSurface()
         .animation(.snappy, value: model.sync)
+    }
+
+    /// Horizontally scrolling region pills; the selected one is filled ink.
+    private var regionChips: some View {
+        ScrollView(.horizontal) {
+            HStack(spacing: 8) {
+                Image(systemName: "globe")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(Theme.blue)
+                    .accessibilityLabel("Region")
+                ForEach(LeaderboardRegion.allCases) { region in
+                    let on = region == model.region
+                    Button { model.setRegion(region) } label: {
+                        Text(region.label)
+                            .font(.footnote.weight(.semibold))
+                            .lineLimit(1)
+                            .foregroundStyle(on ? .white : Theme.ink)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 7)
+                            .background(on ? Theme.ink : .clear, in: .capsule)
+                            .overlay { Capsule().strokeBorder(on ? Theme.ink : Theme.hairline) }
+                    }
+                    .buttonStyle(PlayersPressStyle())
+                    .accessibilityAddTraits(on ? .isSelected : [])
+                }
+            }
+        }
+        .scrollIndicators(.hidden)
+        .animation(.snappy, value: model.region)
+        .sensoryFeedback(.selection, trigger: model.region)
     }
 
     @ViewBuilder
@@ -335,7 +387,7 @@ struct PlayersView: View {
             let count = model.results.count
             let plus = count >= 200 ? "+" : ""
             let header: String = !searching
-                ? "Top 10 · \(model.division.label)"
+                ? "Top 10 · \(model.division.label) · \(model.region.label)"
                 : count == 0 ? "" : model.isLoading ? "\(count)\(plus) matches so far" : "\(count)\(plus) match\(count == 1 ? "" : "es")"
             if !header.isEmpty {
                 Text(header)
@@ -351,7 +403,7 @@ struct PlayersView: View {
                     title: model.isLoading ? "Still searching…" : "No players found",
                     message: model.isLoading
                         ? "Nobody named “\(q)” yet. The rest of the leaderboard is still loading."
-                        : "Nobody named “\(q)” in \(model.division.label). Only players with Championship Points this season are listed.",
+                        : "Nobody named “\(q)” in \(model.division.label)\(model.region == .global ? "" : " (\(model.region.label))"). Only players with Championship Points this season are listed.",
                     retry: nil,
                     showLink: false
                 )
@@ -551,6 +603,7 @@ private struct PlayerDetailSheet: View {
     let players: [LeaderboardPlayer]
     let total: Int
     let division: Division
+    let region: LeaderboardRegion
     let isMe: Bool
     let onToggleMe: () -> Void
     @Environment(\.openURL) private var openURL
@@ -571,7 +624,7 @@ private struct PlayerDetailSheet: View {
                     RankBadge(rank: player.rank, size: 56)
                     VStack(alignment: .leading, spacing: 2) {
                         Text(player.name).font(.title2.bold()).foregroundStyle(Theme.ink)
-                        Text([player.country, division.label].compactMap { $0 }.joined(separator: " · "))
+                        Text([player.country, division.label, region == .global ? nil : region.label].compactMap { $0 }.joined(separator: " · "))
                             .font(.subheadline).foregroundStyle(Theme.muted)
                     }
                 }

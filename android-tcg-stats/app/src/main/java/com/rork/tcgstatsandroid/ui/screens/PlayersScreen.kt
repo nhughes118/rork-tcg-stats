@@ -13,7 +13,10 @@ import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
+import androidx.compose.animation.animateColorAsState
 import androidx.compose.foundation.background
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -42,6 +45,7 @@ import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.EmojiEvents
 import androidx.compose.material.icons.filled.PersonSearch
+import androidx.compose.material.icons.filled.Public
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Star
@@ -91,6 +95,7 @@ import com.rork.tcgstatsandroid.data.Leaderboard
 import com.rork.tcgstatsandroid.data.LeaderboardException
 import com.rork.tcgstatsandroid.data.LeaderboardIndex
 import com.rork.tcgstatsandroid.data.LeaderboardPlayer
+import com.rork.tcgstatsandroid.data.LeaderboardRegion
 import com.rork.tcgstatsandroid.ui.components.CanvasBackground
 import com.rork.tcgstatsandroid.ui.components.Chevron
 import com.rork.tcgstatsandroid.ui.components.SegmentedPicker
@@ -122,6 +127,7 @@ sealed interface LeaderboardSync {
 data class PlayersUiState(
     val query: String = "",
     val division: Division = Division.Masters,
+    val region: LeaderboardRegion = LeaderboardRegion.Global,
     val sync: LeaderboardSync = LeaderboardSync.Idle,
     val players: List<LeaderboardPlayer> = emptyList(),
     val total: Int = 0,
@@ -135,6 +141,7 @@ class PlayersViewModel(app: Application) : AndroidViewModel(app) {
         PlayersUiState(
             query = prefs.getString(KEY_QUERY, "") ?: "",
             division = Division.entries.firstOrNull { it.name == prefs.getString(KEY_DIVISION, null) } ?: Division.Masters,
+            region = LeaderboardRegion.entries.firstOrNull { it.name == prefs.getString(KEY_REGION, null) } ?: LeaderboardRegion.Global,
         )
     )
     val state: StateFlow<PlayersUiState> = _state
@@ -144,12 +151,12 @@ class PlayersViewModel(app: Application) : AndroidViewModel(app) {
     private var cacheIndex: LeaderboardIndex? = null
 
     init {
-        viewModelScope.launch { restoreCache(_state.value.division) }
+        viewModelScope.launch { restoreCache(_state.value.division, _state.value.region) }
     }
 
-    private suspend fun restoreCache(division: Division) {
-        val cached = Leaderboard.cached(getApplication(), division) ?: return
-        if (_state.value.division != division) return
+    private suspend fun restoreCache(division: Division, region: LeaderboardRegion) {
+        val cached = Leaderboard.cached(getApplication(), division, region) ?: return
+        if (_state.value.division != division || _state.value.region != region) return
         cacheIndex = cached
         applyPlayers(cached.players, cached.total)
         _state.update { it.copy(sync = LeaderboardSync.Ready(cached.fetchedAt, cached.complete, cached.season)) }
@@ -171,12 +178,24 @@ class PlayersViewModel(app: Application) : AndroidViewModel(app) {
 
     fun setDivision(division: Division) {
         if (division == _state.value.division) return
+        prefs.edit().putString(KEY_DIVISION, division.name).apply()
+        switchBoard { it.copy(division = division) }
+    }
+
+    fun setRegion(region: LeaderboardRegion) {
+        if (region == _state.value.region) return
+        prefs.edit().putString(KEY_REGION, region.name).apply()
+        switchBoard { it.copy(region = region) }
+    }
+
+    /** Clears the current board and shows the cached one for the new division/region, if any. */
+    private fun switchBoard(change: (PlayersUiState) -> PlayersUiState) {
         loadJob?.cancel()
         cacheIndex = null
         normalized = emptyList()
-        prefs.edit().putString(KEY_DIVISION, division.name).apply()
-        _state.update { it.copy(division = division, players = emptyList(), results = emptyList(), total = 0, me = null, sync = LeaderboardSync.Idle) }
-        viewModelScope.launch { restoreCache(division) }
+        _state.update { change(it).copy(players = emptyList(), results = emptyList(), total = 0, me = null, sync = LeaderboardSync.Idle) }
+        val s = _state.value
+        viewModelScope.launch { restoreCache(s.division, s.region) }
     }
 
     /** Loads the division if there's no fresh cache. */
@@ -184,8 +203,9 @@ class PlayersViewModel(app: Application) : AndroidViewModel(app) {
         if (loadJob?.isActive == true) return
         viewModelScope.launch {
             val division = _state.value.division
-            val cached = cacheIndex ?: Leaderboard.cached(getApplication(), division)?.also { cacheIndex = it }
-            if (cached != null && cached.division == division.slug && Leaderboard.isFresh(cached)) {
+            val region = _state.value.region
+            val cached = cacheIndex ?: Leaderboard.cached(getApplication(), division, region)?.also { cacheIndex = it }
+            if (cached != null && cached.division == division.slug && cached.region == region.zone && Leaderboard.isFresh(cached)) {
                 if (_state.value.players.isEmpty()) {
                     applyPlayers(cached.players, cached.total)
                     _state.update { it.copy(sync = LeaderboardSync.Ready(cached.fetchedAt, cached.complete, cached.season)) }
@@ -199,12 +219,13 @@ class PlayersViewModel(app: Application) : AndroidViewModel(app) {
     fun refresh(activity: Activity) {
         loadJob?.cancel()
         val division = _state.value.division
+        val region = _state.value.region
         val hadPlayers = _state.value.players.isNotEmpty()
         _state.update { it.copy(sync = LeaderboardSync.Loading(0, it.total)) }
         loadJob = viewModelScope.launch {
             var lastEmit = 0L
             try {
-                val index = Leaderboard.load(activity, division) { collected, total ->
+                val index = Leaderboard.load(activity, division, region) { collected, total ->
                     _state.update { it.copy(sync = LeaderboardSync.Loading(collected.size, total)) }
                     val now = System.currentTimeMillis()
                     // Stream partial results only when there's nothing cached to show yet.
@@ -286,6 +307,7 @@ class PlayersViewModel(app: Application) : AndroidViewModel(app) {
     private companion object {
         const val KEY_QUERY = "players_query"
         const val KEY_DIVISION = "players_division"
+        const val KEY_REGION = "players_region"
         const val KEY_ME_NAME = "players_me_name"
         const val KEY_ME_DIVISION = "players_me_division"
         const val KEY_ME_RANK = "players_me_rank"
@@ -337,7 +359,7 @@ fun PlayersScreen(modifier: Modifier = Modifier, vm: PlayersViewModel = viewMode
     val haptic = LocalHapticFeedback.current
     var selectedKey by rememberSaveable { mutableStateOf<String?>(null) }
 
-    LaunchedEffect(state.division, activity) {
+    LaunchedEffect(state.division, state.region, activity) {
         activity?.let(vm::ensureLoaded)
     }
 
@@ -370,6 +392,11 @@ fun PlayersScreen(modifier: Modifier = Modifier, vm: PlayersViewModel = viewMode
                         haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                         vm.setDivision(it)
                     },
+                    region = state.region,
+                    onRegion = {
+                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        vm.setRegion(it)
+                    },
                     sync = state.sync,
                     indexed = state.players.size,
                     onRefresh = { activity?.let(vm::refresh) },
@@ -397,7 +424,7 @@ fun PlayersScreen(modifier: Modifier = Modifier, vm: PlayersViewModel = viewMode
                 else -> {
                     item(key = "header") {
                         val label = when {
-                            !searching -> "Top 10 · ${state.division.label}"
+                            !searching -> "Top 10 · ${state.division.label} · ${state.region.label}"
                             state.results.isEmpty() -> ""
                             loading -> "${state.results.size}${if (state.results.size >= 200) "+" else ""} matches so far"
                             else -> "${state.results.size}${if (state.results.size >= 200) "+" else ""} match${if (state.results.size == 1) "" else "es"}"
@@ -420,7 +447,7 @@ fun PlayersScreen(modifier: Modifier = Modifier, vm: PlayersViewModel = viewMode
                                 message = if (loading) {
                                     "Nobody named “${state.query.trim()}” yet. The rest of the leaderboard is still loading."
                                 } else {
-                                    "Nobody named “${state.query.trim()}” in ${state.division.label}. Only players with Championship Points this season are listed."
+                                    "Nobody named “${state.query.trim()}” in ${state.division.label}${if (state.region == LeaderboardRegion.Global) "" else " (${state.region.label})"}. Only players with Championship Points this season are listed."
                                 },
                                 primary = null,
                                 url = null,
@@ -463,6 +490,7 @@ fun PlayersScreen(modifier: Modifier = Modifier, vm: PlayersViewModel = viewMode
                 players = state.players,
                 total = state.total,
                 division = state.division,
+                region = state.region,
                 isMe = state.me?.key == selected.key,
                 onToggleMe = {
                     haptic.performHapticFeedback(HapticFeedbackType.LongPress)
@@ -480,6 +508,8 @@ private fun PlayerSearchCard(
     onQuery: (String) -> Unit,
     division: Division,
     onDivision: (Division) -> Unit,
+    region: LeaderboardRegion,
+    onRegion: (LeaderboardRegion) -> Unit,
     sync: LeaderboardSync,
     indexed: Int,
     onRefresh: () -> Unit,
@@ -528,7 +558,38 @@ private fun PlayerSearchCard(
             onSelect = onDivision,
             modifier = Modifier.fillMaxWidth(),
         )
+        RegionChips(region, onRegion)
         SyncLine(sync, indexed, onRefresh)
+    }
+}
+
+/** Horizontally scrolling region pills; the selected one is filled ink. */
+@Composable
+private fun RegionChips(selected: LeaderboardRegion, onSelect: (LeaderboardRegion) -> Unit) {
+    val scroll = rememberScrollState()
+    Row(
+        Modifier.fillMaxWidth().horizontalScroll(scroll),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(Icons.Filled.Public, contentDescription = "Region", tint = Palette.Blue, modifier = Modifier.size(18.dp))
+        LeaderboardRegion.entries.forEach { region ->
+            val on = region == selected
+            val bg by animateColorAsState(if (on) Palette.Ink else Color.Transparent, label = "regionBg")
+            val fg by animateColorAsState(if (on) Color.White else Palette.Ink, label = "regionFg")
+            Text(
+                region.label,
+                fontSize = 13.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = fg,
+                maxLines = 1,
+                modifier = Modifier
+                    .background(bg, RoundedCornerShape(50))
+                    .border(1.dp, if (on) Palette.Ink else Palette.Hairline, RoundedCornerShape(50))
+                    .pressable { onSelect(region) }
+                    .padding(horizontal = 12.dp, vertical = 7.dp),
+            )
+        }
     }
 }
 
@@ -734,6 +795,7 @@ private fun PlayerDetail(
     players: List<LeaderboardPlayer>,
     total: Int,
     division: Division,
+    region: LeaderboardRegion,
     isMe: Boolean,
     onToggleMe: () -> Unit,
     onOpen: () -> Unit,
@@ -752,7 +814,7 @@ private fun PlayerDetail(
             RankBadge(player.rank, size = 56)
             Column(Modifier.weight(1f)) {
                 Text(player.name, fontSize = 24.sp, fontWeight = FontWeight.Bold, color = Palette.Ink)
-                Text(listOfNotNull(player.country, division.label).joinToString(" · "), fontSize = 15.sp, color = Palette.Muted)
+                Text(listOfNotNull(player.country, division.label, region.label.takeIf { region != LeaderboardRegion.Global }).joinToString(" · "), fontSize = 15.sp, color = Palette.Muted)
             }
         }
         Column(

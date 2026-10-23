@@ -44,6 +44,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.font.FontWeight
@@ -137,7 +138,14 @@ fun DecklistSheet(
             )
             TextButton(onClick = onDismiss) { Text("Done", color = Palette.Blue, fontWeight = FontWeight.SemiBold, fontSize = 17.sp) }
         }
-        LazyColumn(contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 32.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+        // A fixed list height keeps the sheet the same size in both tabs, so loading
+        // matches never makes it jump to full screen. The list scrolls inside instead.
+        val listHeight = (LocalConfiguration.current.screenHeightDp * 0.62f).dp
+        LazyColumn(
+            modifier = Modifier.height(listHeight),
+            contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 32.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp),
+        ) {
             if (labsRef != null) {
                 item(key = "tabs") {
                     SegmentedPicker(

@@ -210,21 +210,6 @@ struct DecklistSheet: View {
             if matches.isEmpty {
                 Section { Text("No matches recorded for this player.").foregroundStyle(.secondary) }
             } else {
-                Section("By opponent deck") {
-                    ForEach(MatchupSummary.make(matches)) { row in
-                        HStack(spacing: 12) {
-                            DeckIconView(icons: row.icons, size: 36)
-                            Text(row.deck)
-                                .foregroundStyle(Theme.ink)
-                                .lineLimit(1)
-                            Spacer(minLength: 8)
-                            Text(row.recordText)
-                                .font(.body.weight(.bold))
-                                .monospacedDigit()
-                                .foregroundStyle(row.wins > row.losses ? Theme.blue : row.losses > row.wins ? Theme.red : Theme.ink)
-                        }
-                    }
-                }
                 Section("Rounds") {
                     ForEach(matches) { match in
                         MatchRow(match: match)
@@ -327,37 +312,6 @@ struct DecklistSheet: View {
             try? await Task.sleep(for: .seconds(2))
             guard !Task.isCancelled else { return }
             withAnimation(.spring(duration: 0.3)) { didCopy = false }
-        }
-    }
-}
-
-/// A player's record against each opponent deck.
-private struct MatchupSummary: Identifiable {
-    let deck: String
-    let icons: [String]
-    var wins = 0
-    var losses = 0
-    var ties = 0
-    var id: String { deck }
-    var recordText: String { ties > 0 ? "\(wins)-\(losses)-\(ties)" : "\(wins)-\(losses)" }
-
-    static func make(_ matches: [LabsLimitless.LabsMatch]) -> [MatchupSummary] {
-        var byDeck: [String: MatchupSummary] = [:]
-        var order: [String] = []
-        for m in matches where m.opponent != nil {
-            if byDeck[m.opponentDeck] == nil {
-                byDeck[m.opponentDeck] = MatchupSummary(deck: m.opponentDeck, icons: m.opponentIcons)
-                order.append(m.opponentDeck)
-            }
-            switch m.result {
-            case .win: byDeck[m.opponentDeck]?.wins += 1
-            case .loss: byDeck[m.opponentDeck]?.losses += 1
-            case .tie: byDeck[m.opponentDeck]?.ties += 1
-            }
-        }
-        return order.compactMap { byDeck[$0] }.sorted {
-            let a = $0.wins + $0.losses + $0.ties, b = $1.wins + $1.losses + $1.ties
-            return a != b ? a > b : $0.deck < $1.deck
         }
     }
 }

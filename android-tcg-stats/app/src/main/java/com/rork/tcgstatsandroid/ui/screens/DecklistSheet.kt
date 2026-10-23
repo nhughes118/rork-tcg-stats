@@ -159,7 +159,6 @@ fun DecklistSheet(
                         Box(Modifier.fillMaxWidth().cardSurface()) { EmptyRow("No matches recorded for this player.") }
                     }
                     loaded != null -> {
-                        item(key = "summary") { MatchSection("By opponent deck") { MatchupSummaryRows(loaded) } }
                         item(key = "rounds") {
                             MatchSection("Rounds") {
                                 loaded.forEachIndexed { index, match ->
@@ -298,45 +297,6 @@ private fun MatchSection(title: String, content: @Composable () -> Unit) {
             modifier = Modifier.padding(start = 16.dp, bottom = 6.dp),
         )
         Column(Modifier.fillMaxWidth().cardSurface(16.dp).padding(horizontal = 14.dp, vertical = 4.dp)) { content() }
-    }
-}
-
-/** A player's record against each opponent deck. */
-@Composable
-private fun MatchupSummaryRows(matches: List<LabsLimitless.LabsMatch>) {
-    data class Line(val deck: String, val icons: List<String>, var w: Int = 0, var l: Int = 0, var t: Int = 0)
-    val lines = remember(matches) {
-        val map = LinkedHashMap<String, Line>()
-        matches.filter { it.opponent != null }.forEach { m ->
-            val line = map.getOrPut(m.opponentDeck) { Line(m.opponentDeck, m.opponentIcons) }
-            when (m.result) {
-                LabsLimitless.MatchResult.Win -> line.w++
-                LabsLimitless.MatchResult.Loss -> line.l++
-                LabsLimitless.MatchResult.Tie -> line.t++
-            }
-        }
-        map.values.sortedWith(compareByDescending<Line> { it.w + it.l + it.t }.thenBy { it.deck })
-    }
-    lines.forEachIndexed { index, line ->
-        if (index > 0) RowDivider(start = 48.dp)
-        Row(
-            Modifier.fillMaxWidth().padding(vertical = 8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
-            DeckIcon(line.icons, size = 36.dp)
-            Text(line.deck, fontSize = 17.sp, color = Palette.Ink, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
-            Text(
-                if (line.t > 0) "${line.w}-${line.l}-${line.t}" else "${line.w}-${line.l}",
-                fontSize = 17.sp,
-                fontWeight = FontWeight.Bold,
-                color = when {
-                    line.w > line.l -> Palette.Blue
-                    line.l > line.w -> Palette.Red
-                    else -> Palette.Ink
-                },
-            )
-        }
     }
 }
 

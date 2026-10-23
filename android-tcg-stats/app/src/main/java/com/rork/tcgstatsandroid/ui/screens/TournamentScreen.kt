@@ -1,5 +1,7 @@
 package com.rork.tcgstatsandroid.ui.screens
 
+import androidx.compose.animation.animateContentSize
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -11,13 +13,19 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.filled.EmojiEvents
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Groups
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.material3.VerticalDivider
@@ -29,18 +37,25 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.rork.tcgstatsandroid.data.CardText
 import com.rork.tcgstatsandroid.data.PlayerEntry
 import com.rork.tcgstatsandroid.ui.AppViewModel
 import com.rork.tcgstatsandroid.ui.components.CanvasBackground
 import com.rork.tcgstatsandroid.ui.components.Dates
 import com.rork.tcgstatsandroid.ui.components.DetailTopBar
 import com.rork.tcgstatsandroid.ui.components.FinisherRow
+import com.rork.tcgstatsandroid.ui.components.EmptyRow
 import com.rork.tcgstatsandroid.ui.components.RowDivider
+import com.rork.tcgstatsandroid.ui.components.SegmentedPicker
 import com.rork.tcgstatsandroid.ui.components.TrophyIcon
 import com.rork.tcgstatsandroid.ui.components.UsageRing
 import com.rork.tcgstatsandroid.ui.components.cardSurface
@@ -57,6 +72,8 @@ fun TournamentScreen(vm: AppViewModel, tournamentId: String, cardKey: String, ac
     var selectedId by rememberSaveable { mutableStateOf<String?>(null) }
     val selected = remember(tournament, selectedId) { selectedId?.let { id -> tournament?.entries?.firstOrNull { it.id == id } } }
     var showAll by rememberSaveable { mutableStateOf(false) }
+    var scope by rememberSaveable { mutableStateOf(ResultsScope.WithCard) }
+    var query by rememberSaveable { mutableStateOf("") }
     val uriHandler = LocalUriHandler.current
 
     CanvasBackground(modifier) {
@@ -78,7 +95,14 @@ fun TournamentScreen(vm: AppViewModel, tournamentId: String, cardKey: String, ac
                 tournament.entries.filter { cardKey in it.cardKeys }.sortedBy { it.placing ?: Int.MAX_VALUE }
             }
             val usage = users.size.toDouble() / maxOf(tournament.entries.size, 1)
-            val visible = if (showAll) users else users.take(16)
+            val everyone = remember(tournament) { tournament.entries.sortedBy { it.placing ?: Int.MAX_VALUE } }
+            val base = if (scope == ResultsScope.WithCard) users else everyone
+            val filtered = remember(base, query) {
+                val tokens = CardText.key(query).split(" ").filter { it.isNotEmpty() }
+                if (tokens.isEmpty()) base
+                else base.filter { e -> val hay = CardText.key("${e.name} ${e.deckName}"); tokens.all { hay.contains(it) } }
+            }
+            val visible = if (showAll || query.isNotBlank()) filtered else filtered.take(16)
 
             Column(
                 Modifier
@@ -127,20 +151,47 @@ fun TournamentScreen(vm: AppViewModel, tournamentId: String, cardKey: String, ac
                     }
                 }
 
-                Text("Top Finishers Using This Card", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = Palette.Ink)
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text(
+                        if (scope == ResultsScope.WithCard) "Top Finishers Using This Card" else "All Results",
+                        fontSize = 20.sp, fontWeight = FontWeight.Bold, color = Palette.Ink,
+                    )
+                    SegmentedPicker(
+                        options = ResultsScope.entries.toList(),
+                        selected = scope,
+                        label = { if (it == ResultsScope.WithCard) "With this card · ${users.size}" else "All decks · ${everyone.size}" },
+                        onSelect = { scope = it; showAll = false },
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    if (scope == ResultsScope.All) {
+                        ResultsSearchField(query, onQuery = { query = it })
+                        if (tournament.players > everyone.size) {
+                            Text(
+                                "${everyone.size} of ${tournament.players} players published a decklist.",
+                                fontSize = 12.sp, color = Palette.Muted,
+                            )
+                        }
+                    }
+                }
 
-                Column(Modifier.fillMaxWidth().cardSurface().padding(horizontal = 16.dp, vertical = 6.dp)) {
+                Column(Modifier.fillMaxWidth().cardSurface().padding(horizontal = 16.dp, vertical = 6.dp).animateContentSize()) {
+                    if (visible.isEmpty()) {
+                        EmptyRow(if (query.isNotBlank()) "No player or deck matches “$query”." else "No decklists for this event.")
+                    }
                     visible.forEachIndexed { index, entry ->
                         if (index > 0) RowDivider(start = 56.dp)
                         FinisherRow(entry, Modifier.pressable { selectedId = entry.id }, copies = entry.copies(cardKey))
                     }
-                    if (users.size > visible.size) {
+                    if (filtered.size > visible.size) {
                         RowDivider()
                         Box(
                             Modifier.fillMaxWidth().heightIn(min = 48.dp).pressable { showAll = true },
                             contentAlignment = Alignment.Center,
                         ) {
-                            Text("Show all ${users.size} players", fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = Palette.Blue)
+                            Text(
+                                if (scope == ResultsScope.WithCard) "Show all ${filtered.size} players" else "Show all ${filtered.size} decks",
+                                fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = Palette.Blue,
+                            )
                         }
                     }
                 }
@@ -162,5 +213,42 @@ fun TournamentScreen(vm: AppViewModel, tournamentId: String, cardKey: String, ac
 
     selected?.let { entry ->
         DecklistSheet(entry, highlightKey = cardKey, tournamentName = tournament?.name, onOpenCard = actions.openCard, onDismiss = { selectedId = null })
+    }
+}
+
+private enum class ResultsScope { WithCard, All }
+
+@Composable
+private fun ResultsSearchField(query: String, onQuery: (String) -> Unit) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .height(44.dp)
+            .background(Color(0x1F767680), RoundedCornerShape(12.dp))
+            .padding(horizontal = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(Icons.Filled.Search, contentDescription = null, tint = Palette.Red, modifier = Modifier.size(20.dp))
+        Spacer(Modifier.width(8.dp))
+        Box(Modifier.weight(1f)) {
+            if (query.isEmpty()) Text("Search player or deck", fontSize = 16.sp, color = Palette.Muted)
+            BasicTextField(
+                value = query,
+                onValueChange = onQuery,
+                singleLine = true,
+                textStyle = TextStyle(fontSize = 16.sp, color = Palette.Ink),
+                cursorBrush = SolidColor(Palette.Red),
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search, autoCorrectEnabled = false),
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
+        if (query.isNotEmpty()) {
+            Icon(
+                Icons.Filled.Close,
+                contentDescription = "Clear",
+                tint = Palette.Muted,
+                modifier = Modifier.size(20.dp).pressable { onQuery("") },
+            )
+        }
     }
 }

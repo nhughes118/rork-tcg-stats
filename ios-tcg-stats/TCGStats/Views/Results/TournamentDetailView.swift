@@ -10,6 +10,11 @@ struct TournamentDetailView: View {
     @State private var reopenEntry: PlayerEntry?
     @State private var pendingCardKey: String?
     @State private var showAll: Bool = false
+    @State private var scope: ResultsScope = .withCard
+    @State private var query: String = ""
+    @FocusState private var searchFocused: Bool
+
+    private enum ResultsScope: Hashable { case withCard, all }
 
     var body: some View {
         let tournament = model.dataset?.tournament(id: tournamentID)
@@ -20,7 +25,9 @@ struct TournamentDetailView: View {
                     .filter { $0.cardKeys.contains(cardKey) }
                     .sorted { ($0.placing ?? Int.max) < ($1.placing ?? Int.max) }
                 let usage = Double(users.count) / Double(max(tournament.entries.count, 1))
-                let visible = showAll ? users : Array(users.prefix(16))
+                let everyone = tournament.entries.sorted { ($0.placing ?? Int.max) < ($1.placing ?? Int.max) }
+                let filtered = filter(scope == .withCard ? users : everyone)
+                let visible = showAll || !query.isEmpty ? filtered : Array(filtered.prefix(16))
 
                 VStack(alignment: .leading, spacing: 18) {
                     HStack(alignment: .top, spacing: 14) {
@@ -79,23 +86,52 @@ struct TournamentDetailView: View {
                     .padding(.horizontal, 8)
                     .cardSurface()
 
-                    Text("Top Finishers Using This Card")
-                        .font(.title3.weight(.bold))
-                        .foregroundStyle(Theme.ink)
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text(scope == .withCard ? "Top Finishers Using This Card" : "All Results")
+                            .font(.title3.weight(.bold))
+                            .foregroundStyle(Theme.ink)
+                            .contentTransition(.opacity)
+                        Picker("Results", selection: Binding(
+                            get: { scope },
+                            set: { value in withAnimation(.snappy) { scope = value; showAll = false } }
+                        )) {
+                            Text("With this card · \(users.count)").tag(ResultsScope.withCard)
+                            Text("All decks · \(everyone.count)").tag(ResultsScope.all)
+                        }
+                        .pickerStyle(.segmented)
+                        .sensoryFeedback(.selection, trigger: scope)
+
+                        if scope == .all {
+                            searchField
+                            if tournament.players > everyone.count {
+                                Text("\(everyone.count) of \(tournament.players) players published a decklist.")
+                                    .font(.caption)
+                                    .foregroundStyle(Theme.muted)
+                            }
+                        }
+                    }
 
                     VStack(spacing: 0) {
+                        if visible.isEmpty {
+                            Text(query.isEmpty ? "No decklists for this event." : "No player or deck matches “\(query)”.")
+                                .font(.subheadline)
+                                .foregroundStyle(Theme.muted)
+                                .multilineTextAlignment(.center)
+                                .frame(maxWidth: .infinity, minHeight: 56)
+                        }
                         ForEach(Array(visible.enumerated()), id: \.element.id) { index, entry in
                             if index > 0 { Divider().overlay(Theme.hairline).padding(.leading, 56) }
                             Button {
+                                searchFocused = false
                                 selectedEntry = entry
                             } label: {
                                 FinisherRow(entry: entry, copies: entry.copies(of: cardKey))
                             }
                             .buttonStyle(PressableStyle())
                         }
-                        if users.count > visible.count {
+                        if filtered.count > visible.count {
                             Divider().overlay(Theme.hairline)
-                            Button("Show all \(users.count) players") {
+                            Button(scope == .withCard ? "Show all \(filtered.count) players" : "Show all \(filtered.count) decks") {
                                 withAnimation(.snappy) { showAll = true }
                             }
                             .font(.subheadline.weight(.semibold))
@@ -127,6 +163,7 @@ struct TournamentDetailView: View {
         .navigationTitle(tournament?.name ?? "Tournament")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar(.hidden, for: .tabBar)
+        .scrollDismissesKeyboard(.interactively)
         .sheet(item: $selectedEntry, onDismiss: openPendingCard) { entry in
             DecklistSheet(entry: entry, highlightKey: cardKey, tournamentName: tournament?.name) { key in
                 reopenEntry = entry
@@ -138,6 +175,39 @@ struct TournamentDetailView: View {
             guard let entry = reopenEntry else { return }
             reopenEntry = nil
             selectedEntry = entry
+        }
+    }
+
+    private var searchField: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(Theme.red)
+            TextField("Search player or deck", text: $query)
+                .focused($searchFocused)
+                .submitLabel(.search)
+                .autocorrectionDisabled()
+                .textInputAutocapitalization(.never)
+                .onSubmit { searchFocused = false }
+            if !query.isEmpty {
+                Button { query = "" } label: {
+                    Image(systemName: "xmark.circle.fill").foregroundStyle(Theme.muted)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Clear")
+            }
+        }
+        .padding(.horizontal, 12)
+        .frame(height: 44)
+        .background(Color(.tertiarySystemFill), in: .rect(cornerRadius: 12))
+    }
+
+    /// Entries whose player or deck name contains every word of the search.
+    private func filter(_ entries: [PlayerEntry]) -> [PlayerEntry] {
+        let tokens = CardText.key(query).split(separator: " ").map(String.init)
+        guard !tokens.isEmpty else { return entries }
+        return entries.filter { entry in
+            let hay = CardText.key("\(entry.name) \(entry.deckName)")
+            return tokens.allSatisfy { hay.contains($0) }
         }
     }
 

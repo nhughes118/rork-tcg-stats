@@ -73,7 +73,7 @@ struct CardResultsView: View {
 
     private func footer(stats: CardStats) -> some View {
         let scope = model.source == .official
-            ? "top-\(LimitlessClient.officialListLimit) decklists from \(stats.tournamentCount) official tournaments"
+            ? "\(stats.totalDecks) decklists from \(stats.tournamentCount) official tournaments"
             : "\(stats.totalDecks) decklists from \(stats.tournamentCount) Standard tournaments"
         return VStack(spacing: 4) {
             Text("Based on \(scope)")

@@ -119,7 +119,8 @@ data class TournamentRecord(
     val url: String
         get() = when (source) {
             DataSource.Online -> "https://play.limitlesstcg.com/tournament/$id/standings"
-            DataSource.Official -> "https://limitlesstcg.com/tournaments/$id"
+            DataSource.Official ->
+                if (LabsLimitless.isLabsId(id)) LabsLimitless.pageUrl(id) else "https://limitlesstcg.com/tournaments/$id"
         }
 }
 

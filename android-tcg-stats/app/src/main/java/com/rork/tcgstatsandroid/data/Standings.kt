@@ -66,7 +66,11 @@ object TournamentStandings {
     }
 
     private suspend fun fetch(record: TournamentRecord): List<StandingRow> = when (record.source) {
-        DataSource.Official -> OfficialLimitless.parseStandings(OfficialLimitless.fetchPage("/tournaments/${record.id}")).map {
+        DataSource.Official -> if (LabsLimitless.isLabsId(record.id)) {
+            LabsLimitless.standings(LabsLimitless.labsId(record.id)).map {
+                StandingRow(it.placing, it.name, it.deckName, it.icons, it.wins, it.losses, it.ties, listId = null)
+            }
+        } else OfficialLimitless.parseStandings(OfficialLimitless.fetchPage("/tournaments/${record.id}")).map {
             StandingRow(placing = it.rank, name = it.name, deckName = it.deck, deckIcons = it.icons, listId = it.listId)
         }
         DataSource.Online -> {
@@ -90,7 +94,7 @@ object TournamentStandings {
         }
     }
 
-    /** Fetches a decklist that wasn't part of the dataset (official finishers beyond the top 64). */
+    /** Fetches a decklist that wasn't part of the dataset (scraped official finishers beyond the top 64). */
     suspend fun decklist(listId: String): List<DeckCard> {
         decklists[listId]?.let { return it }
         val cards = OfficialLimitless.parseDecklist(OfficialLimitless.fetchPage("/decks/list/$listId"))

@@ -314,7 +314,7 @@ private fun TournamentsSection(stats: CardStats, isOfficial: Boolean, onSeeAll: 
 @Composable
 private fun ResultsFooter(stats: CardStats, source: DataSource) {
     val scope = if (source == DataSource.Official) {
-        "top-${LimitlessClient.OFFICIAL_LIST_LIMIT} decklists from ${stats.tournamentCount} official tournaments"
+        "${stats.totalDecks} decklists from ${stats.tournamentCount} official tournaments"
     } else {
         "${stats.totalDecks} decklists from ${stats.tournamentCount} Standard tournaments"
     }

@@ -51,6 +51,12 @@ nonisolated enum TournamentStandings {
     private static func fetch(_ record: TournamentRecord) async throws -> [StandingRow] {
         switch record.source {
         case .official:
+            if LabsLimitless.isLabsID(record.id) {
+                return try await LabsLimitless.standings(LabsLimitless.labsID(record.id)).map {
+                    StandingRow(placing: $0.placing, name: $0.name, deckName: $0.deckName, deckIcons: $0.icons,
+                                wins: $0.wins, losses: $0.losses, ties: $0.ties, listID: nil)
+                }
+            }
             let html = try await OfficialLimitless.fetchPage("/tournaments/\(record.id)")
             return OfficialLimitless.parseStandings(html).map {
                 StandingRow(placing: $0.rank, name: $0.name, deckName: $0.deck, deckIcons: $0.icons,
@@ -82,7 +88,7 @@ nonisolated enum TournamentStandings {
         }
     }
 
-    /// Fetches a decklist that wasn't part of the dataset (official finishers beyond the top 64).
+    /// Fetches a decklist that wasn't part of the dataset (scraped official finishers beyond the top 64).
     static func decklist(_ listID: String) async throws -> [DeckCard] {
         OfficialLimitless.parseDecklist(try await OfficialLimitless.fetchPage("/decks/list/\(listID)"))
     }

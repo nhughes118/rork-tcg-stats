@@ -145,7 +145,8 @@ nonisolated struct TournamentRecord: Codable, Hashable, Identifiable, Sendable {
     var url: URL? {
         switch source {
         case .online: URL(string: "https://play.limitlesstcg.com/tournament/\(id)/standings")
-        case .official: URL(string: "https://limitlesstcg.com/tournaments/\(id)")
+        case .official:
+            LabsLimitless.isLabsID(id) ? LabsLimitless.pageURL(id) : URL(string: "https://limitlesstcg.com/tournaments/\(id)")
         }
     }
 }

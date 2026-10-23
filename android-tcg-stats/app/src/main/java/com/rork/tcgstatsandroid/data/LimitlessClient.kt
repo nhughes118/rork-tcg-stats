@@ -38,6 +38,8 @@ object LimitlessClient {
     const val OFFICIAL_LIST_LIMIT = 64
     /** Maximum official events (homepage recent + older completed) per load. */
     private const val OFFICIAL_MAX_EVENTS = 8
+    /** Parallel decklist requests against Limitless Labs. */
+    private const val LABS_CONCURRENCY = 24
 
     private const val BAD_RESPONSE = "Limitless TCG didn't respond as expected. Please try again."
     private const val NO_DATA = "No recent tournament decklists were found."
@@ -173,9 +175,91 @@ object LimitlessClient {
         return records
     }
 
-    // Official (limitlesstcg.com scraping)
+    // Official via Limitless Labs (full standings + every player's decklist)
 
-    private suspend fun loadOfficial(context: Context, progress: (Double) -> Unit): List<TournamentRecord> = coroutineScope {
+    /** Shares identical card lines across decklists; full events hold thousands of near-identical lists. */
+    private fun intern(records: List<TournamentRecord>): List<TournamentRecord> {
+        val cards = HashMap<DeckCard, DeckCard>()
+        val keys = HashMap<String, String>()
+        return records.map { r ->
+            r.copy(entries = r.entries.map { e ->
+                e.copy(
+                    cards = e.cards.map { c -> cards.getOrPut(c) { c } },
+                    cardKeys = e.cardKeys.mapTo(HashSet(e.cardKeys.size * 2)) { k -> keys.getOrPut(k) { k } },
+                )
+            })
+        }
+    }
+
+    private suspend fun labsRecord(context: Context, t: LabsLimitless.LabsTournament, progress: (Int, Int) -> Unit): TournamentRecord? {
+        val recordId = LabsLimitless.ID_PREFIX + t.id
+        cachedRecord(context, recordId, DataSource.Official)?.let { return it }
+        val standings = LabsLimitless.standings(t.id)
+        if (standings.isEmpty()) return null
+        val withLists = standings.filter { it.hasList }
+        val done = AtomicInteger(0)
+        val failed = AtomicInteger(0)
+        val entries = withLists.mapConcurrent(LABS_CONCURRENCY) { s ->
+            var cards: List<DeckCard>? = null
+            for (attempt in 0 until 3) {
+                cards = runCatching { LabsLimitless.decklist(t.id, s.tpId) }.getOrNull()
+                if (cards != null) break
+            }
+            progress(done.incrementAndGet(), withLists.size)
+            if (cards == null) failed.incrementAndGet()
+            val list = cards.orEmpty()
+            if (list.isEmpty()) return@mapConcurrent null
+            PlayerEntry(
+                id = "$recordId-${s.tpId}",
+                name = s.name,
+                placing = s.placing,
+                wins = s.wins,
+                losses = s.losses,
+                ties = s.ties,
+                deckName = s.deckName,
+                deckIcons = s.icons,
+                cards = list,
+                cardKeys = list.map { it.key }.toSet(),
+            )
+        }.filterNotNull()
+        if (entries.isEmpty()) return null
+        val record = TournamentRecord(recordId, t.name, t.date, standings.size, entries, DataSource.Official)
+        // Cache only (nearly) complete events so a flaky load is retried next time.
+        if (failed.get() <= withLists.size / 50) saveCache(context, record)
+        return record
+    }
+
+    private suspend fun loadLabs(context: Context, progress: (Double) -> Unit): List<TournamentRecord> {
+        val now = System.currentTimeMillis()
+        progress(0.02)
+        val oldest = now - WEEKS_BACK * Weeks.WEEK
+        val selected = LabsLimitless.tournaments()
+            .filter { it.completed && it.date in oldest..now }
+            .sortedByDescending { it.date }
+            .take(OFFICIAL_MAX_EVENTS)
+        if (selected.isEmpty()) return emptyList()
+        // Progress is split evenly per event; each event reports its decklists.
+        val records = mutableListOf<TournamentRecord>()
+        selected.forEachIndexed { index, t ->
+            val base = 0.04 + 0.96 * index / selected.size
+            val record = runCatching {
+                labsRecord(context, t) { done, total -> progress(base + 0.96 / selected.size * done / maxOf(total, 1)) }
+            }.getOrNull()
+            if (record != null) records += record
+            progress(0.04 + 0.96 * (index + 1) / selected.size)
+        }
+        return records
+    }
+
+    // Official fallback (limitlesstcg.com scraping, top finishers only)
+
+    private suspend fun loadOfficial(context: Context, progress: (Double) -> Unit): List<TournamentRecord> {
+        val labs = runCatching { loadLabs(context, progress) }.getOrElse { emptyList() }
+        if (labs.isNotEmpty()) return labs
+        return loadOfficialScraped(context, progress)
+    }
+
+    private suspend fun loadOfficialScraped(context: Context, progress: (Double) -> Unit): List<TournamentRecord> = coroutineScope {
         val now = System.currentTimeMillis()
         progress(0.03)
         // Primary: the homepage "Recent Tournaments" block. Secondary: older completed events for trend depth.
@@ -246,10 +330,10 @@ object LimitlessClient {
     /** Loads the dataset, reporting progress between 0 and 1 (may be called off the main thread). */
     suspend fun loadDataset(context: Context, source: DataSource, progress: (Double) -> Unit): CardDataset {
         val now = System.currentTimeMillis()
-        val records = when (source) {
+        val records = intern(when (source) {
             DataSource.Online -> loadOnline(context) { progress(it * 0.85) }
             DataSource.Official -> loadOfficial(context) { progress(it * 0.85) }
-        }
+        })
         // Split Pokémon names that cover several distinct cards (e.g. Fire vs Darkness Chi-Yu).
         val variants = runCatching { CardVariants.resolve(context, records) { progress(0.85 + 0.15 * it) } }
             .getOrElse { emptyMap() }

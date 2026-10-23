@@ -143,9 +143,113 @@ nonisolated enum LimitlessClient {
         }
     }
 
-    // MARK: Official (limitlesstcg.com scraping)
+    // MARK: Official via Limitless Labs (full standings + every player's decklist)
+
+    /// Parallel decklist requests against Limitless Labs.
+    static let labsConcurrency = 24
+
+    /// Shares identical card lines across decklists; full events hold thousands of near-identical lists.
+    private static func intern(_ records: [TournamentRecord]) -> [TournamentRecord] {
+        var cards: [DeckCard: DeckCard] = [:]
+        return records.map { r in
+            let entries = r.entries.map { e in
+                let shared = e.cards.map { c in
+                    if let existing = cards[c] { return existing }
+                    cards[c] = c
+                    return c
+                }
+                return PlayerEntry(id: e.id, name: e.name, placing: e.placing, wins: e.wins, losses: e.losses, ties: e.ties,
+                                   deckName: e.deckName, deckIcons: e.deckIcons, cards: shared, cardKeys: e.cardKeys)
+            }
+            return TournamentRecord(id: r.id, name: r.name, date: r.date, players: r.players, entries: entries, source: r.source)
+        }
+    }
+
+    private static func labsRecord(_ t: LabsLimitless.LabsTournament, progress: @escaping @Sendable (Int, Int) -> Void) async throws -> TournamentRecord? {
+        let recordID = LabsLimitless.idPrefix + t.id
+        let summary = TournamentSummary(id: recordID, name: t.name, date: t.date, players: 0)
+        if let cached = cachedRecord(summary, .official) { return cached }
+        let standings = try await LabsLimitless.standings(t.id)
+        guard !standings.isEmpty else { return nil }
+        let withLists = standings.filter(\.hasList)
+
+        var lists: [Int: [DeckCard]] = [:]
+        var done = 0
+        var failed = 0
+        await withTaskGroup(of: (Int, [DeckCard]?).self) { group in
+            var iterator = withLists.makeIterator()
+            func addNext() {
+                guard let s = iterator.next() else { return }
+                group.addTask {
+                    for _ in 0..<3 {
+                        if let cards = try? await LabsLimitless.decklist(t.id, tpID: s.tpID) { return (s.tpID, cards) }
+                    }
+                    return (s.tpID, nil)
+                }
+            }
+            for _ in 0..<labsConcurrency { addNext() }
+            for await (tp, cards) in group {
+                done += 1
+                progress(done, withLists.count)
+                if let cards { if !cards.isEmpty { lists[tp] = cards } } else { failed += 1 }
+                addNext()
+            }
+        }
+
+        let entries: [PlayerEntry] = withLists.compactMap { s in
+            guard let cards = lists[s.tpID] else { return nil }
+            return PlayerEntry(
+                id: "\(recordID)-\(s.tpID)",
+                name: s.name,
+                placing: s.placing,
+                wins: s.wins,
+                losses: s.losses,
+                ties: s.ties,
+                deckName: s.deckName,
+                deckIcons: s.icons,
+                cards: cards,
+                cardKeys: Set(cards.map(\.key))
+            )
+        }
+        guard !entries.isEmpty else { return nil }
+        let record = TournamentRecord(id: recordID, name: t.name, date: t.date, players: standings.count, entries: entries, source: .official)
+        // Cache only (nearly) complete events so a flaky load is retried next time.
+        if failed <= withLists.count / 50 { saveCache(record) }
+        return record
+    }
+
+    private static func loadLabs(progress: @escaping @Sendable (Double) -> Void) async -> [TournamentRecord] {
+        let now = Date()
+        progress(0.02)
+        let oldest = now.addingTimeInterval(-Double(weeksBack) * 7 * 86_400)
+        guard let all = try? await LabsLimitless.tournaments() else { return [] }
+        let selected = all
+            .filter { $0.completed && $0.date >= oldest && $0.date <= now }
+            .sorted { $0.date > $1.date }
+            .prefix(officialMaxEvents)
+        guard !selected.isEmpty else { return [] }
+        var records: [TournamentRecord] = []
+        let count = Double(selected.count)
+        for (index, t) in selected.enumerated() {
+            let base = 0.04 + 0.96 * Double(index) / count
+            let record = try? await labsRecord(t) { done, total in
+                progress(base + 0.96 / count * Double(done) / Double(max(total, 1)))
+            }
+            if let record { records.append(record) }
+            progress(0.04 + 0.96 * Double(index + 1) / count)
+        }
+        return records
+    }
 
     private static func loadOfficial(progress: @escaping @Sendable (Double) -> Void) async throws -> CardDataset {
+        let labs = await loadLabs(progress: progress)
+        if !labs.isEmpty { return CardDataset(tournaments: labs, now: Date()) }
+        return try await loadOfficialScraped(progress: progress)
+    }
+
+    // MARK: Official fallback (limitlesstcg.com scraping, top finishers only)
+
+    private static func loadOfficialScraped(progress: @escaping @Sendable (Double) -> Void) async throws -> CardDataset {
         let now = Date()
         progress(0.03)
         // Primary: the homepage "Recent Tournaments" block. Secondary: older completed events for trend depth.
@@ -305,10 +409,11 @@ nonisolated enum LimitlessClient {
     /// Loads the dataset, reporting progress between 0 and 1.
     static func loadDataset(source: DataSource, progress: @escaping @Sendable (Double) -> Void) async throws -> CardDataset {
         let scaled: @Sendable (Double) -> Void = { progress($0 * 0.85) }
-        let base: CardDataset = switch source {
+        let loaded: CardDataset = switch source {
         case .online: try await loadOnline(progress: scaled)
         case .official: try await loadOfficial(progress: scaled)
         }
+        let base = CardDataset(tournaments: intern(loaded.tournaments), now: loaded.generatedAt)
         // Split Pokémon names that cover several distinct cards (e.g. Fire vs Darkness Chi-Yu).
         let variants = await CardVariants.resolve(base.tournaments) { progress(0.85 + 0.15 * $0) }
         progress(1)

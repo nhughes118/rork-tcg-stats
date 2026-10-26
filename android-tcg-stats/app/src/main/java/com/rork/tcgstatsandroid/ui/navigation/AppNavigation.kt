@@ -119,8 +119,9 @@ fun AppNavigation(vm: AppViewModel = viewModel()) {
         containerColor = Palette.Canvas,
         contentWindowInsets = WindowInsets(0),
         bottomBar = {
-            if (currentTab != null) {
-                NavigationBar(containerColor = Palette.Surface, tonalElevation = 0.dp) {
+            // The bar stays on detail screens too (e.g. a card opened from History); no tab is
+            // highlighted there, but the user can still jump straight to another section.
+            NavigationBar(containerColor = Palette.Surface, tonalElevation = 0.dp) {
                     tabs.forEach { tab ->
                         NavigationBarItem(
                             selected = tab == currentTab,
@@ -137,7 +138,6 @@ fun AppNavigation(vm: AppViewModel = viewModel()) {
                         )
                     }
                 }
-            }
         },
     ) { innerPadding ->
         NavHost(

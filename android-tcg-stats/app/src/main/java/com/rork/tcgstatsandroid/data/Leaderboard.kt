@@ -436,7 +436,19 @@ object Leaderboard {
 
         suspend fun open(url: String): PageSetup {
             withContext(Dispatchers.Main) {
-                val view = WebView(activity)
+                // The hidden page sits on top of the app, so it must never receive touches: otherwise taps fall
+                // through to the site's own dropdowns (region / leaderboard type / season) and open their pickers.
+                val view = object : WebView(activity) {
+                    override fun dispatchTouchEvent(event: android.view.MotionEvent?): Boolean = false
+                    @SuppressLint("ClickableViewAccessibility")
+                    override fun onTouchEvent(event: android.view.MotionEvent?): Boolean = false
+                    override fun dispatchGenericMotionEvent(event: android.view.MotionEvent?): Boolean = false
+                }
+                view.isClickable = false
+                view.isLongClickable = false
+                view.isFocusable = false
+                view.isFocusableInTouchMode = false
+                view.importantForAccessibility = android.view.View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
                 view.settings.javaScriptEnabled = true
                 view.settings.domStorageEnabled = true
                 view.settings.loadsImagesAutomatically = false

@@ -79,7 +79,7 @@ final class AppModel {
         }
         states[src] = .loading(0)
         do {
-            let result = try await LimitlessClient.loadDataset(source: src) { value in
+            let result = try await LimitlessClient.loadDataset(source: src) { [weak self] value in
                 Task { @MainActor [weak self] in
                     guard let self, case .loading(let current) = self.states[src], value > current else { return }
                     self.states[src] = .loading(value)

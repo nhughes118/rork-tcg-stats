@@ -397,7 +397,6 @@ nonisolated enum LimitlessClient {
     ) async throws -> CardDataset {
         guard !selected.isEmpty else { throw LimitlessError.noData }
 
-        var records: [TournamentRecord] = []
         var cached: [TournamentRecord] = []
         var pending: [TournamentSummary] = []
         for t in selected {

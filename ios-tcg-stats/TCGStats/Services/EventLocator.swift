@@ -92,28 +92,57 @@ nonisolated enum EventLocator {
         if responses.isEmpty {
             throw EventLocatorError(message: "Pokémon's event site didn't respond. Try again, or open it on Pokémon.com.")
         }
-        let events = await Task.detached { parse(responses, origin: point, rangeMiles: rangeMiles) }.value
+        let events = await Task.detached { await parse(responses, origin: point, rangeMiles: rangeMiles) }.value
         print("[Events] \(responses.count) responses -> \(events.count) events")
         return events
     }
 
     // MARK: Parsing
 
-    static func parse(_ responses: [EventPageLoader.Captured], origin: GeoPoint, rangeMiles: Int) -> [LocalEvent] {
-        var byID: [String: LocalEvent] = [:]
-        var order: [String] = []
+    static func parse(_ responses: [EventPageLoader.Captured], origin: GeoPoint, rangeMiles: Int) async -> [LocalEvent] {
+        struct Raw {
+            let o: [String: Any]
+            let parent: [String: Any]?
+            let strict: Bool
+        }
+        var raws: [Raw] = []
         for response in responses {
             guard let data = response.body.data(using: .utf8),
                   let root = try? JSONSerialization.jsonObject(with: data) else { continue }
             let strict = response.url.localizedCaseInsensitiveContains("Premier") || response.url.localizedCaseInsensitiveContains("Related")
-            walk(root, parent: nil) { obj, parent in
-                guard let event = makeEvent(obj, parent: parent, origin: origin) else { return }
-                if let d = event.distanceMiles, d > Double(rangeMiles) + 1 { return }
-                if event.distanceMiles == nil && strict { return }
-                if byID[event.id] == nil {
-                    byID[event.id] = event
-                    order.append(event.id)
-                }
+            walk(root, parent: nil) { obj, parent in raws.append(Raw(o: obj, parent: parent, strict: strict)) }
+        }
+        // The Event Locator sends start times in the venue's local time with no marker, so the venue's zone
+        // has to be resolved from coordinates. Warm the cache for every unique map cell up front, in parallel,
+        // so building the events afterwards is instant.
+        var cells: [(String, (Double, Double))] = []
+        var seenCells = Set<String>()
+        for r in raws {
+            let lat = number(object(r.o, "address", "location"), "latitude", "lat") ?? number(r.o, "latitude", "lat")
+            let lng = number(object(r.o, "address", "location"), "longitude", "lng", "lon") ?? number(r.o, "longitude", "lng", "lon")
+            if let lat, let lng, !(lat == 0 && lng == 0) {
+                let cell = zoneCell(lat: lat, lng: lng)
+                if seenCells.insert(cell.0).inserted { cells.append(cell) }
+            }
+        }
+        await withTaskGroup(of: TimeZone?.self) { group in
+            var pending = cells.makeIterator()
+            for _ in 0..<8 {
+                if let c = pending.next() { group.addTask { await venueZone(lat: c.1.0, lng: c.1.1) } }
+            }
+            while await group.next() != nil {
+                if let c = pending.next() { group.addTask { await venueZone(lat: c.1.0, lng: c.1.1) } }
+            }
+        }
+        var byID: [String: LocalEvent] = [:]
+        var order: [String] = []
+        for r in raws {
+            guard let event = await makeEvent(r.o, parent: r.parent, origin: origin) else { continue }
+            if let d = event.distanceMiles, d > Double(rangeMiles) + 1 { continue }
+            if event.distanceMiles == nil && r.strict { continue }
+            if byID[event.id] == nil {
+                byID[event.id] = event
+                order.append(event.id)
             }
         }
         let cutoff = Date.now.addingTimeInterval(-12 * 3600)
@@ -171,7 +200,7 @@ nonisolated enum EventLocator {
         return !start.hasPrefix("1900")
     }
 
-    private static func makeEvent(_ o: [String: Any], parent: [String: Any]?, origin: GeoPoint) -> LocalEvent? {
+    private static func makeEvent(_ o: [String: Any], parent: [String: Any]?, origin: GeoPoint) async -> LocalEvent? {
         guard let name = text(o, "name"),
               let startRaw = text(o, "start_datetime", "start_date", "startdate", "when") else { return nil }
         let address = object(o, "address", "location")
@@ -184,8 +213,24 @@ nonisolated enum EventLocator {
         if let lat, let lng, !(lat == 0 && lng == 0) { coords = (lat, lng) }
         let distance = coords.map { haversineMiles(origin.latitude, origin.longitude, $0.0, $0.1) }
 
-        let tz = text(address, "timezone", "time_zone") ?? text(o, "timezone", "time_zone")
-        let parsed = parseDate(startRaw, zone: tz)
+        let tzField = text(address, "timezone", "time_zone") ?? text(o, "timezone", "time_zone")
+        let explicit = hasOffset(startRaw)
+        lock.lock()
+        let first = !loggedShape
+        loggedShape = true
+        lock.unlock()
+        if first {
+            let keys = o.keys.sorted().joined(separator: ",")
+            print("[Events] first event: keys=[\(keys)] start=\(startRaw) tzField=\(tzField ?? "-") explicitOffset=\(explicit)")
+        }
+        // Venue-local clock time, in order of trust: an explicit UTC offset in the string, the payload's own
+        // zone field, then the venue's zone looked up from its coordinates (falls back to UTC).
+        var resolved = safeZone(tzField ?? "")
+        if resolved == nil, let coords {
+            resolved = await venueZone(lat: coords.0, lng: coords.1)
+        }
+        let zone: TimeZone? = explicit ? nil : resolved
+        let parsed = parseDate(startRaw, zone: zone?.identifier ?? tzField)
 
         let venue = text(address, "name", "venue_name") ?? text(o, "VenueName", "venue_name") ?? text(group, "display_name", "name")
         let cityLine = [text(o, "State") ?? text(address, "state"), text(o, "PostalCode") ?? text(address, "postal_code")]
@@ -212,7 +257,7 @@ nonisolated enum EventLocator {
             typeName: typeName,
             start: parsed?.0,
             hasTime: parsed?.1 ?? false,
-            timeZoneID: tz,
+            timeZoneID: zone?.identifier ?? tzField,
             venue: venue,
             address: fullAddress,
             latitude: coords?.0,
@@ -245,6 +290,13 @@ nonisolated enum EventLocator {
         return .other
     }
 
+    /// True when the datetime string carries its own UTC offset (or a trailing Z).
+    static func hasOffset(_ raw: String) -> Bool {
+        let s = raw.trimmingCharacters(in: .whitespaces)
+        if s.hasSuffix("Z") { return true }
+        return s.range(of: #"[+-]\d{2}:?\d{2}$"#, options: .regularExpression) != nil
+    }
+
     /// Returns the date and whether the source included a time of day.
     static func parseDate(_ raw: String, zone: String?) -> (Date, Bool)? {
         var s = raw.trimmingCharacters(in: .whitespaces).replacingOccurrences(of: " ", with: "T")
@@ -273,6 +325,59 @@ nonisolated enum EventLocator {
         let dLat = (lat2 - lat1) * .pi / 180, dLon = (lon2 - lon1) * .pi / 180
         let a = sin(dLat / 2) * sin(dLat / 2) + cos(lat1 * .pi / 180) * cos(lat2 * .pi / 180) * sin(dLon / 2) * sin(dLon / 2)
         return r * 2 * atan2(sqrt(a), sqrt(1 - a))
+    }
+
+    // MARK: Venue time zones
+
+    private static let zonePref = "events_tz_"
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var zoneCache: [String: TimeZone] = [:]
+    nonisolated(unsafe) private static var zoneMisses: Set<String> = []
+    nonisolated(unsafe) private static var loggedShape = false
+
+    /// Map cell key (~0.25°) and the coordinates of its center, so nearby venues share one lookup.
+    private static func zoneCell(lat: Double, lng: Double) -> (String, (Double, Double)) {
+        let gLat = Int((lat * 4).rounded())
+        let gLng = Int((lng * 4).rounded())
+        return ("\(gLat):\(gLng)", (Double(gLat) / 4.0, Double(gLng) / 4.0))
+    }
+
+    private static func safeZone(_ id: String) -> TimeZone? {
+        guard let tz = TimeZone(identifier: id), tz.identifier == id else { return nil }
+        return tz
+    }
+
+    /// The venue's zone for coordinates, from memory, disk, or Open-Meteo's timezone lookup.
+    static func venueZone(lat: Double, lng: Double) async -> TimeZone? {
+        let (key, center) = zoneCell(lat: lat, lng: lng)
+        lock.lock()
+        if let tz = zoneCache[key] { lock.unlock(); return tz }
+        if zoneMisses.contains(key) { lock.unlock(); return nil }
+        lock.unlock()
+        if let stored = UserDefaults.standard.string(forKey: zonePref + key) {
+            guard let tz = safeZone(stored) else {
+                lock.lock(); zoneMisses.insert(key); lock.unlock()
+                return nil
+            }
+            lock.lock(); zoneCache[key] = tz; lock.unlock()
+            return tz
+        }
+        var comps = URLComponents(string: "https://api.open-meteo.com/v1/forecast")!
+        comps.queryItems = [
+            .init(name: "latitude", value: String(center.0)),
+            .init(name: "longitude", value: String(center.1)),
+            .init(name: "current", value: "temperature_2m"),
+            .init(name: "timezone", value: "auto"),
+        ]
+        let id = (await getJSON(comps.url!) as? [String: Any])?["timezone"] as? String
+        guard let id, let tz = safeZone(id) else {
+            lock.lock(); zoneMisses.insert(key); lock.unlock()
+            UserDefaults.standard.set("-", forKey: zonePref + key)
+            return nil
+        }
+        lock.lock(); zoneCache[key] = tz; lock.unlock()
+        UserDefaults.standard.set(tz.identifier, forKey: zonePref + key)
+        return tz
     }
 
     private static let usStates: [String: String] = [

@@ -3,6 +3,7 @@ package com.rork.tcgstatsandroid.data
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.Context
+import android.content.SharedPreferences
 import android.location.Geocoder
 import android.os.Handler
 import android.os.Looper
@@ -18,6 +19,10 @@ import androidx.webkit.WebViewFeature
 import android.widget.FrameLayout
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.JsonArray
@@ -34,8 +39,11 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.atan2
 import kotlin.math.cos
+import kotlin.math.roundToInt
 import kotlin.math.sin
 import kotlin.math.sqrt
 
@@ -329,25 +337,48 @@ object EventLocator {
     suspend fun search(activity: Activity, point: GeoPoint, rangeMiles: Int): List<LocalEvent> {
         val responses = fetchResponses(activity, pageUrl(point.latitude, point.longitude, rangeMiles))
         if (responses.isEmpty()) throw EventLocatorException("Pokémon's event site didn't respond. Try again, or open it on Pokémon.com.")
-        val events = withContext(Dispatchers.Default) { parse(responses, point, rangeMiles) }
+        val prefs = activity.getSharedPreferences("events_zones", Context.MODE_PRIVATE)
+        val events = withContext(Dispatchers.Default) { parse(responses, point, rangeMiles, prefs) }
         Log.d("Events", "${responses.size} responses -> ${events.size} events")
         return events
     }
 
     // ---------- Parsing ----------
 
-    fun parse(responses: List<Captured>, origin: GeoPoint, rangeMiles: Int): List<LocalEvent> {
-        val byId = LinkedHashMap<String, LocalEvent>()
+    suspend fun parse(responses: List<Captured>, origin: GeoPoint, rangeMiles: Int, prefs: SharedPreferences? = null): List<LocalEvent> {
+        val raws = ArrayList<Triple<JsonObject, JsonObject?, Boolean>>()
         for (response in responses) {
             val root = runCatching { LimitlessClient.json.parseToJsonElement(response.body) }.getOrNull() ?: continue
             val strict = response.url.contains("Premier", true) || response.url.contains("Related", true)
-            walk(root, null) { obj, parent ->
-                val event = toEvent(obj, parent, origin) ?: return@walk
-                val d = event.distanceMiles
-                if (d != null && d > rangeMiles + 1) return@walk
-                if (d == null && strict) return@walk
-                if (!byId.containsKey(event.id)) byId[event.id] = event
+            walk(root, null) { obj, parent -> raws += Triple(obj, parent, strict) }
+        }
+        // The Event Locator sends start times in the venue's local time with no marker, so the venue's zone
+        // has to be resolved from coordinates. Warm the cache for every unique map cell up front, in parallel,
+        // so building the events afterwards is instant.
+        val cells = LinkedHashSet<Pair<String, Pair<Double, Double>>>()
+        for ((o, _, _) in raws) {
+            val lat = o.obj("address", "location").let { it?.number("latitude", "lat") } ?: o.number("latitude", "lat")
+            val lng = o.obj("address", "location").let { it?.number("longitude", "lng", "lon") } ?: o.number("longitude", "lng", "lon")
+            if (lat != null && lng != null && !(lat == 0.0 && lng == 0.0)) cells += zoneCell(lat, lng)
+        }
+        val missing = cells.filter { (key, _) -> !zoneCache.containsKey(key) && !zoneMisses.contains(key) && prefs?.getString(ZONE_PREF + key, null) == null }
+        if (missing.isNotEmpty()) {
+            runCatching {
+                val semaphore = Semaphore(8)
+                coroutineScope {
+                    missing.forEach { (_, center) ->
+                        async { semaphore.withPermit { venueZone(center.first, center.second, prefs) } }
+                    }
+                }
             }
+        }
+        val byId = LinkedHashMap<String, LocalEvent>()
+        for ((o, parent, strict) in raws) {
+            val event = toEvent(o, parent, origin, prefs) ?: continue
+            val d = event.distanceMiles
+            if (d != null && d > rangeMiles + 1) continue
+            if (d == null && strict) continue
+            if (!byId.containsKey(event.id)) byId[event.id] = event
         }
         val now = System.currentTimeMillis() - 12 * 3_600_000L
         return byId.values
@@ -378,7 +409,7 @@ object EventLocator {
         return p.doubleOrNull ?: p.contentOrNull?.toDoubleOrNull()
     }
 
-    private fun walk(element: JsonElement, parent: JsonObject?, visit: (JsonObject, JsonObject?) -> Unit) {
+    private suspend fun walk(element: JsonElement, parent: JsonObject?, visit: suspend (JsonObject, JsonObject?) -> Unit) {
         when (element) {
             is JsonObject -> {
                 if (isEvent(element)) {
@@ -399,7 +430,7 @@ object EventLocator {
         return !start.startsWith("1900")
     }
 
-    private fun toEvent(o: JsonObject, parent: JsonObject?, origin: GeoPoint): LocalEvent? {
+    private suspend fun toEvent(o: JsonObject, parent: JsonObject?, origin: GeoPoint, prefs: SharedPreferences?): LocalEvent? {
         val name = o.text("name") ?: return null
         val startRaw = o.text("start_datetime", "start_date", "startdate", "when") ?: return null
         val address = o.obj("address", "location")
@@ -411,8 +442,16 @@ object EventLocator {
         val validCoords = lat != null && lng != null && !(lat == 0.0 && lng == 0.0)
         val distance = if (validCoords) haversineMiles(origin.latitude, origin.longitude, lat!!, lng!!) else null
 
-        val tz = address?.text("timezone", "time_zone") ?: o.text("timezone", "time_zone")
-        val (millis, hasTime) = parseDate(startRaw, tz) ?: (null to false)
+        val tzField = address?.text("timezone", "time_zone") ?: o.text("timezone", "time_zone")
+        val explicit = hasOffset(startRaw)
+        if (loggedShape.compareAndSet(false, true)) {
+            Log.d("Events", "first event: keys=[${o.keys.joinToString(",")}] start=$startRaw tzField=$tzField explicitOffset=$explicit")
+        }
+        // Venue-local clock time, in order of trust: an explicit UTC offset in the string, the payload's own
+        // zone field, then the venue's zone looked up from its coordinates (falls back to UTC).
+        val zone = if (explicit) null else tzField?.let(::safeZone)
+            ?: (if (validCoords) venueZone(lat!!, lng!!, prefs) else null)
+        val (millis, hasTime) = parseDate(startRaw, zone?.id ?: tzField) ?: (null to false)
 
         val venue = address?.text("name", "venue_name") ?: o.text("VenueName", "venue_name") ?: group?.text("display_name", "name")
         val fullAddress = address?.text("full_address", "formatted_address")
@@ -438,7 +477,7 @@ object EventLocator {
             typeName = typeName,
             startMillis = millis,
             hasTime = hasTime,
-            timeZone = tz,
+            timeZone = zone?.id ?: tzField,
             venue = venue,
             address = fullAddress,
             latitude = if (validCoords) lat else null,
@@ -469,6 +508,13 @@ object EventLocator {
         else -> EventKind.Other
     }
 
+    /** True when the datetime string carries its own UTC offset (or a trailing Z). */
+    fun hasOffset(raw: String): Boolean {
+        val s = raw.trim()
+        if (s.endsWith("Z")) return true
+        return Regex("[+-]\\d{2}:?\\d{2}$").containsMatchIn(s)
+    }
+
     /** Returns epoch millis and whether the source included a time of day. */
     fun parseDate(raw: String, zone: String?): Pair<Long, Boolean>? {
         var s = raw.trim().replace(" ", "T").replace(Regex("\\.\\d+"), "")
@@ -494,6 +540,53 @@ object EventLocator {
         val dLon = Math.toRadians(lon2 - lon1)
         val a = sin(dLat / 2) * sin(dLat / 2) + cos(Math.toRadians(lat1)) * cos(Math.toRadians(lat2)) * sin(dLon / 2) * sin(dLon / 2)
         return r * 2 * atan2(sqrt(a), sqrt(1 - a))
+    }
+
+    // ---------- Venue time zones ----------
+
+    private const val ZONE_PREF = "events_tz_"
+    private val zoneCache = ConcurrentHashMap<String, TimeZone>()
+    private val zoneMisses = ConcurrentHashMap.newKeySet<String>()
+    private val loggedShape = AtomicBoolean(false)
+
+    /** Map cell key (~0.25°) and the coordinates of its center, so nearby venues share one lookup. */
+    private fun zoneCell(lat: Double, lng: Double): Pair<String, Pair<Double, Double>> {
+        val gLat = (lat * 4).roundToInt()
+        val gLng = (lng * 4).roundToInt()
+        return "$gLat:$gLng" to (gLat / 4.0 to gLng / 4.0)
+    }
+
+    /** TimeZone.getTimeZone returns GMT for unknown ids; reject those so a bad id falls back to UTC. */
+    private fun safeZone(id: String): TimeZone? = TimeZone.getTimeZone(id).takeIf { it.id == id }
+
+    /** The venue's zone for coordinates, from memory, disk, or Open-Meteo's timezone lookup. */
+    suspend fun venueZone(lat: Double, lng: Double, prefs: SharedPreferences?): TimeZone? {
+        val (key, center) = zoneCell(lat, lng)
+        zoneCache[key]?.let { return it }
+        if (zoneMisses.contains(key)) return null
+        prefs?.getString(ZONE_PREF + key, null)?.let { stored ->
+            return safeZone(stored)?.also { zoneCache[key] = it } ?: run { zoneMisses.add(key); null }
+        }
+        val body = runCatching {
+            LimitlessClient.httpGet(
+                "https://api.open-meteo.com/v1/forecast?latitude=${center.first}&longitude=${center.second}&current=temperature_2m&timezone=auto",
+                "application/json",
+            )
+        }.getOrNull()
+        val id = body?.let { b ->
+            runCatching {
+                (LimitlessClient.json.parseToJsonElement(b).jsonObject["timezone"] as? JsonPrimitive)?.contentOrNull
+            }.getOrNull()
+        }
+        val tz = id?.let(::safeZone)
+        if (tz != null) {
+            zoneCache[key] = tz
+            prefs?.edit()?.putString(ZONE_PREF + key, tz.id)?.apply()
+        } else {
+            zoneMisses.add(key)
+            prefs?.edit()?.putString(ZONE_PREF + key, "-")?.apply()
+        }
+        return tz
     }
 
     private val US_STATES = mapOf(

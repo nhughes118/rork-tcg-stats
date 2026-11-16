@@ -237,7 +237,7 @@ object EventLocator {
     // can come back empty. If no event list arrives, the page is reloaded (cookies and search state are in place
     // by then), which is what a second manual search used to do.
     private const val MAX_RELOADS = 3
-    private const val RELOAD_AFTER_MS = 9_000L
+    private const val RELOAD_AFTER_MS = 12_000L
 
     /** Loads the official Event Locator in an invisible WebView and captures its data responses. */
     @SuppressLint("SetJavaScriptEnabled")
@@ -291,21 +291,21 @@ object EventLocator {
                     Log.d("Events", "captured ${u.substringAfterLast('/')} (${b.length} bytes)")
                     if (u.contains("GetEventList", true)) {
                         // A cold session's first event list can come back empty while the site's bot check
-                        // is still settling. Only accept it once it holds events, or after a reload —
-                        // otherwise the reload below never happens and the search shows no results.
+                        // is still settling. Never settle for an empty list while reloads remain — the
+                        // watchdog reloads the page and the warm session's list has events. Only when the
+                        // retries are spent do we finish with whatever arrived.
                         val events = runCatching { countEvents(LimitlessClient.json.parseToJsonElement(b)) }.getOrDefault(0)
-                        if (events > 0 || reloads >= 1) {
+                        if (events > 0) {
                             sawEventList = true
                             handler.removeCallbacks(watchdog)
                             // Event lists arrive in batches; finish once they go quiet.
                             handler.removeCallbacks(finish)
                             handler.postDelayed(finish, 3_000)
+                        } else if (reloads >= MAX_RELOADS) {
+                            handler.removeCallbacks(finish)
+                            handler.postDelayed(finish, 3_000)
                         } else {
-                            Log.d("Events", "event list came back empty; waiting for reload")
-                            if (reloads >= MAX_RELOADS) {
-                                handler.removeCallbacks(finish)
-                                handler.postDelayed(finish, 3_000)
-                            }
+                            Log.d("Events", "event list came back empty; waiting for reload ($reloads/$MAX_RELOADS)")
                         }
                     } else if (u.contains("GetLocations", true)) {
                         sawLocations = true
@@ -355,6 +355,12 @@ object EventLocator {
         val prefs = activity.getSharedPreferences("events_zones", Context.MODE_PRIVATE)
         val result = withContext(Dispatchers.Default) { parse(responses, point, rangeMiles, prefs) }
         Log.d("Events", "${result.batches} responses -> ${result.candidates} candidates -> ${result.events.size} events")
+        if (result.candidates == 0) {
+            throw EventLocatorException(
+                "Pokémon's event site answered but sent no event data — it's likely busy or blocking this search. " +
+                    "Try again in a minute, or open it on Pokémon.com."
+            )
+        }
         return result
     }
 

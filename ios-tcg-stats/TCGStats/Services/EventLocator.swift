@@ -100,6 +100,12 @@ nonisolated enum EventLocator {
         }
         let result = await Task.detached { await parse(responses, origin: point, rangeMiles: rangeMiles) }.value
         print("[Events] \(result.batches) responses -> \(result.candidates) candidates -> \(result.events.count) events")
+        if result.candidates == 0 {
+            throw EventLocatorError(
+                message: "Pokémon's event site answered but sent no event data — it's likely busy or blocking this search. " +
+                    "Try again in a minute, or open it on Pokémon.com."
+            )
+        }
         return result
     }
 
@@ -463,7 +469,7 @@ final class EventPageLoader: NSObject, WKScriptMessageHandler, WKNavigationDeleg
     /// requests can come back empty. If no event list arrives, the page is reloaded (cookies and search state
     /// are in place by then), which is what a second manual search used to do.
     private static let maxReloads = 3
-    private static let reloadAfter: Duration = .seconds(9)
+    private static let reloadAfter: Duration = .seconds(12)
 
     private var webView: WKWebView?
     private var url: URL?
@@ -557,17 +563,19 @@ final class EventPageLoader: NSObject, WKScriptMessageHandler, WKNavigationDeleg
         print("[Events] captured \(url.split(separator: "/").last ?? "") (\(body.count) bytes)")
         if url.localizedCaseInsensitiveContains("GetEventList") {
             // A cold session's first event list can come back empty while the site's bot check is still
-            // settling. Only accept it once it holds events, or after a reload — otherwise the reload
-            // below never happens and the search shows no results.
+            // settling. Never settle for an empty list while reloads remain — the watchdog reloads the
+            // page and the warm session's list has events. Only when the retries are spent do we finish
+            // with whatever arrived.
             let events = EventLocator.countEventObjects(in: body)
-            if events > 0 || reloads >= 1 {
+            if events > 0 {
                 sawEventList = true
                 watchdogTask?.cancel()
                 // Event lists arrive in batches; finish once they go quiet.
                 scheduleFinish(after: .seconds(3))
+            } else if reloads >= Self.maxReloads {
+                scheduleFinish(after: .seconds(3))
             } else {
-                print("[Events] event list came back empty; waiting for reload")
-                if reloads >= Self.maxReloads { scheduleFinish(after: .seconds(3)) }
+                print("[Events] event list came back empty; waiting for reload (\(reloads)/\(Self.maxReloads))")
             }
         } else if url.localizedCaseInsensitiveContains("GetLocations") {
             sawLocations = true

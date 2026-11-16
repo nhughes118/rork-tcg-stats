@@ -230,14 +230,11 @@ object EventLocator {
 
     data class Captured(val url: String, val body: String)
 
-    /** Search outcome plus fetch diagnostics, so an empty result can explain itself in the UI. */
-    data class SearchResult(val events: List<LocalEvent>, val batches: Int, val candidates: Int)
-
     // On a first visit the site's bot check sets its cookies while the page loads, so the page's own data requests
     // can come back empty. If no event list arrives, the page is reloaded (cookies and search state are in place
     // by then), which is what a second manual search used to do.
-    private const val MAX_RELOADS = 3
-    private const val RELOAD_AFTER_MS = 12_000L
+    private const val MAX_RELOADS = 2
+    private const val RELOAD_AFTER_MS = 9_000L
 
     /** Loads the official Event Locator in an invisible WebView and captures its data responses. */
     @SuppressLint("SetJavaScriptEnabled")
@@ -290,23 +287,11 @@ object EventLocator {
                     captured += Captured(u, b)
                     Log.d("Events", "captured ${u.substringAfterLast('/')} (${b.length} bytes)")
                     if (u.contains("GetEventList", true)) {
-                        // A cold session's first event list can come back empty while the site's bot check
-                        // is still settling. Never settle for an empty list while reloads remain — the
-                        // watchdog reloads the page and the warm session's list has events. Only when the
-                        // retries are spent do we finish with whatever arrived.
-                        val events = runCatching { countEvents(LimitlessClient.json.parseToJsonElement(b)) }.getOrDefault(0)
-                        if (events > 0) {
-                            sawEventList = true
-                            handler.removeCallbacks(watchdog)
-                            // Event lists arrive in batches; finish once they go quiet.
-                            handler.removeCallbacks(finish)
-                            handler.postDelayed(finish, 3_000)
-                        } else if (reloads >= MAX_RELOADS) {
-                            handler.removeCallbacks(finish)
-                            handler.postDelayed(finish, 3_000)
-                        } else {
-                            Log.d("Events", "event list came back empty; waiting for reload ($reloads/$MAX_RELOADS)")
-                        }
+                        sawEventList = true
+                        handler.removeCallbacks(watchdog)
+                        // Event lists arrive in batches; finish once they go quiet.
+                        handler.removeCallbacks(finish)
+                        handler.postDelayed(finish, 3_000)
                     } else if (u.contains("GetLocations", true)) {
                         sawLocations = true
                         if (reloads >= MAX_RELOADS && !sawEventList) {
@@ -349,24 +334,18 @@ object EventLocator {
         captured.toList()
     }
 
-    suspend fun search(activity: Activity, point: GeoPoint, rangeMiles: Int): SearchResult {
+    suspend fun search(activity: Activity, point: GeoPoint, rangeMiles: Int): List<LocalEvent> {
         val responses = fetchResponses(activity, pageUrl(point.latitude, point.longitude, rangeMiles))
         if (responses.isEmpty()) throw EventLocatorException("Pokémon's event site didn't respond. Try again, or open it on Pokémon.com.")
         val prefs = activity.getSharedPreferences("events_zones", Context.MODE_PRIVATE)
-        val result = withContext(Dispatchers.Default) { parse(responses, point, rangeMiles, prefs) }
-        Log.d("Events", "${result.batches} responses -> ${result.candidates} candidates -> ${result.events.size} events")
-        if (result.candidates == 0) {
-            throw EventLocatorException(
-                "Pokémon's event site answered but sent no event data — it's likely busy or blocking this search. " +
-                    "Try again in a minute, or open it on Pokémon.com."
-            )
-        }
-        return result
+        val events = withContext(Dispatchers.Default) { parse(responses, point, rangeMiles, prefs) }
+        Log.d("Events", "${responses.size} responses -> ${events.size} events")
+        return events
     }
 
     // ---------- Parsing ----------
 
-    suspend fun parse(responses: List<Captured>, origin: GeoPoint, rangeMiles: Int, prefs: SharedPreferences? = null): SearchResult {
+    suspend fun parse(responses: List<Captured>, origin: GeoPoint, rangeMiles: Int, prefs: SharedPreferences? = null): List<LocalEvent> {
         val raws = ArrayList<Triple<JsonObject, JsonObject?, Boolean>>()
         for (response in responses) {
             val root = runCatching { LimitlessClient.json.parseToJsonElement(response.body) }.getOrNull() ?: continue
@@ -402,10 +381,9 @@ object EventLocator {
             if (!byId.containsKey(event.id)) byId[event.id] = event
         }
         val now = System.currentTimeMillis() - 12 * 3_600_000L
-        val events = byId.values
+        return byId.values
             .filter { it.startMillis == null || it.startMillis >= now }
             .sortedWith(compareBy<LocalEvent> { it.startMillis ?: Long.MAX_VALUE }.thenBy { it.distanceMiles ?: Double.MAX_VALUE })
-        return SearchResult(events, responses.size, raws.size)
     }
 
     private fun norm(key: String) = key.lowercase(Locale.US).replace("_", "")
@@ -452,13 +430,6 @@ object EventLocator {
         return !start.startsWith("1900")
     }
 
-    /** Counts event-shaped objects in a captured response body, to spot empty event lists. */
-    private fun countEvents(element: JsonElement): Int = when (element) {
-        is JsonObject -> if (isEvent(element)) 1 else element.values.sumOf { countEvents(it) }
-        is JsonArray -> element.sumOf { countEvents(it) }
-        else -> 0
-    }
-
     private suspend fun toEvent(o: JsonObject, parent: JsonObject?, origin: GeoPoint, prefs: SharedPreferences?): LocalEvent? {
         val name = o.text("name") ?: return null
         val startRaw = o.text("start_datetime", "start_date", "startdate", "when") ?: return null
@@ -472,13 +443,12 @@ object EventLocator {
         val distance = if (validCoords) haversineMiles(origin.latitude, origin.longitude, lat!!, lng!!) else null
 
         val tzField = address?.text("timezone", "time_zone") ?: o.text("timezone", "time_zone")
-        val explicit = hasTrustedOffset(startRaw)
+        val explicit = hasOffset(startRaw)
         if (loggedShape.compareAndSet(false, true)) {
             Log.d("Events", "first event: keys=[${o.keys.joinToString(",")}] start=$startRaw tzField=$tzField explicitOffset=$explicit")
         }
-        // Venue-local clock time, in order of trust: a non-zero UTC offset in the string (a zero offset is
-        // how the site stamps venue-local times, so it isn't trusted), the payload's own zone field, then
-        // the venue's zone looked up from its coordinates (falls back to UTC).
+        // Venue-local clock time, in order of trust: an explicit UTC offset in the string, the payload's own
+        // zone field, then the venue's zone looked up from its coordinates (falls back to UTC).
         val zone = if (explicit) null else tzField?.let(::safeZone)
             ?: (if (validCoords) venueZone(lat!!, lng!!, prefs) else null)
         val (millis, hasTime) = parseDate(startRaw, zone?.id ?: tzField) ?: (null to false)
@@ -541,32 +511,17 @@ object EventLocator {
     /** True when the datetime string carries its own UTC offset (or a trailing Z). */
     fun hasOffset(raw: String): Boolean {
         val s = raw.trim()
-        if (s.endsWith("Z") || s.endsWith("z")) return true
+        if (s.endsWith("Z")) return true
         return Regex("[+-]\\d{2}:?\\d{2}$").containsMatchIn(s)
-    }
-
-    /**
-     * True when the string carries a non-zero UTC offset — the only kind trusted outright. OutSystems
-     * stamps venue-local wall times with a zero offset (a trailing Z or +00:00), so those are treated
-     * as unmarked and interpreted in the venue's zone.
-     */
-    fun hasTrustedOffset(raw: String): Boolean {
-        val s = raw.trim()
-        Regex("([+-])(\\d{2}):?(\\d{2})$").find(s)?.let { m ->
-            return m.groupValues[2].toInt() != 0 || m.groupValues[3].toInt() != 0
-        }
-        return false
     }
 
     /** Returns epoch millis and whether the source included a time of day. */
     fun parseDate(raw: String, zone: String?): Pair<Long, Boolean>? {
         var s = raw.trim().replace(" ", "T").replace(Regex("\\.\\d+"), "")
-        if (s.endsWith("Z") || s.endsWith("z")) s = s.dropLast(1) + "+00:00"
+        if (s.endsWith("Z")) s = s.dropLast(1) + "+00:00"
         if (s.contains("T")) {
             Regex("([+-]\\d{2})(\\d{2})$").find(s)?.let { m -> s = s.replaceRange(m.range, "${m.groupValues[1]}:${m.groupValues[2]}") }
         }
-        // A resolved venue zone outranks a zero offset (see hasTrustedOffset): read the wall clock in it.
-        if (zone != null) s = s.replace(Regex("[+-]00:00$"), "")
         val tz = zone?.let { TimeZone.getTimeZone(it) } ?: TimeZone.getTimeZone("UTC")
         val withOffset = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssXXX", Locale.US)
         runCatching { withOffset.parse(s)?.time }.getOrNull()?.let { return it to true }
@@ -609,9 +564,8 @@ object EventLocator {
         val (key, center) = zoneCell(lat, lng)
         zoneCache[key]?.let { return it }
         if (zoneMisses.contains(key)) return null
-        // A stored "-" is a legacy failed lookup; ignore it so the zone can resolve on a later search.
-        prefs?.getString(ZONE_PREF + key, null)?.takeIf { it != "-" }?.let { stored ->
-            safeZone(stored)?.let { zoneCache[key] = it; return it }
+        prefs?.getString(ZONE_PREF + key, null)?.let { stored ->
+            return safeZone(stored)?.also { zoneCache[key] = it } ?: run { zoneMisses.add(key); null }
         }
         val body = runCatching {
             LimitlessClient.httpGet(
@@ -629,8 +583,8 @@ object EventLocator {
             zoneCache[key] = tz
             prefs?.edit()?.putString(ZONE_PREF + key, tz.id)?.apply()
         } else {
-            // Only remember the miss in memory: a transient failure must not poison the zone on disk.
             zoneMisses.add(key)
+            prefs?.edit()?.putString(ZONE_PREF + key, "-")?.apply()
         }
         return tz
     }

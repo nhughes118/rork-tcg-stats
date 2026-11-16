@@ -230,10 +230,13 @@ object EventLocator {
 
     data class Captured(val url: String, val body: String)
 
+    /** Search outcome plus fetch diagnostics, so an empty result can explain itself in the UI. */
+    data class SearchResult(val events: List<LocalEvent>, val batches: Int, val candidates: Int)
+
     // On a first visit the site's bot check sets its cookies while the page loads, so the page's own data requests
     // can come back empty. If no event list arrives, the page is reloaded (cookies and search state are in place
     // by then), which is what a second manual search used to do.
-    private const val MAX_RELOADS = 2
+    private const val MAX_RELOADS = 3
     private const val RELOAD_AFTER_MS = 9_000L
 
     /** Loads the official Event Locator in an invisible WebView and captures its data responses. */
@@ -346,18 +349,18 @@ object EventLocator {
         captured.toList()
     }
 
-    suspend fun search(activity: Activity, point: GeoPoint, rangeMiles: Int): List<LocalEvent> {
+    suspend fun search(activity: Activity, point: GeoPoint, rangeMiles: Int): SearchResult {
         val responses = fetchResponses(activity, pageUrl(point.latitude, point.longitude, rangeMiles))
         if (responses.isEmpty()) throw EventLocatorException("Pokémon's event site didn't respond. Try again, or open it on Pokémon.com.")
         val prefs = activity.getSharedPreferences("events_zones", Context.MODE_PRIVATE)
-        val events = withContext(Dispatchers.Default) { parse(responses, point, rangeMiles, prefs) }
-        Log.d("Events", "${responses.size} responses -> ${events.size} events")
-        return events
+        val result = withContext(Dispatchers.Default) { parse(responses, point, rangeMiles, prefs) }
+        Log.d("Events", "${result.batches} responses -> ${result.candidates} candidates -> ${result.events.size} events")
+        return result
     }
 
     // ---------- Parsing ----------
 
-    suspend fun parse(responses: List<Captured>, origin: GeoPoint, rangeMiles: Int, prefs: SharedPreferences? = null): List<LocalEvent> {
+    suspend fun parse(responses: List<Captured>, origin: GeoPoint, rangeMiles: Int, prefs: SharedPreferences? = null): SearchResult {
         val raws = ArrayList<Triple<JsonObject, JsonObject?, Boolean>>()
         for (response in responses) {
             val root = runCatching { LimitlessClient.json.parseToJsonElement(response.body) }.getOrNull() ?: continue
@@ -393,9 +396,10 @@ object EventLocator {
             if (!byId.containsKey(event.id)) byId[event.id] = event
         }
         val now = System.currentTimeMillis() - 12 * 3_600_000L
-        return byId.values
+        val events = byId.values
             .filter { it.startMillis == null || it.startMillis >= now }
             .sortedWith(compareBy<LocalEvent> { it.startMillis ?: Long.MAX_VALUE }.thenBy { it.distanceMiles ?: Double.MAX_VALUE })
+        return SearchResult(events, responses.size, raws.size)
     }
 
     private fun norm(key: String) = key.lowercase(Locale.US).replace("_", "")

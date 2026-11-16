@@ -85,21 +85,27 @@ nonisolated enum EventLocator {
 
     // MARK: Search
 
+    struct SearchResult: Sendable {
+        let events: [LocalEvent]
+        let batches: Int
+        let candidates: Int
+    }
+
     @MainActor
-    static func search(near point: GeoPoint, rangeMiles: Int) async throws -> [LocalEvent] {
+    static func search(near point: GeoPoint, rangeMiles: Int) async throws -> SearchResult {
         let url = pageURL(latitude: point.latitude, longitude: point.longitude, rangeMiles: rangeMiles)
         let responses = await EventPageLoader().load(url)
         if responses.isEmpty {
             throw EventLocatorError(message: "Pokémon's event site didn't respond. Try again, or open it on Pokémon.com.")
         }
-        let events = await Task.detached { await parse(responses, origin: point, rangeMiles: rangeMiles) }.value
-        print("[Events] \(responses.count) responses -> \(events.count) events")
-        return events
+        let result = await Task.detached { await parse(responses, origin: point, rangeMiles: rangeMiles) }.value
+        print("[Events] \(result.batches) responses -> \(result.candidates) candidates -> \(result.events.count) events")
+        return result
     }
 
     // MARK: Parsing
 
-    static func parse(_ responses: [EventPageLoader.Captured], origin: GeoPoint, rangeMiles: Int) async -> [LocalEvent] {
+    static func parse(_ responses: [EventPageLoader.Captured], origin: GeoPoint, rangeMiles: Int) async -> SearchResult {
         struct Raw {
             let o: [String: Any]
             let parent: [String: Any]?
@@ -146,12 +152,13 @@ nonisolated enum EventLocator {
             }
         }
         let cutoff = Date.now.addingTimeInterval(-12 * 3600)
-        return order.compactMap { byID[$0] }
+        let events = order.compactMap { byID[$0] }
             .filter { ($0.start ?? .distantFuture) >= cutoff }
             .sorted {
                 let a = $0.start ?? .distantFuture, b = $1.start ?? .distantFuture
                 return a != b ? a < b : ($0.distanceMiles ?? .infinity) < ($1.distanceMiles ?? .infinity)
             }
+        return SearchResult(events: events, batches: responses.count, candidates: raws.count)
     }
 
     private static func norm(_ key: String) -> String { key.lowercased().replacingOccurrences(of: "_", with: "") }
@@ -455,7 +462,7 @@ final class EventPageLoader: NSObject, WKScriptMessageHandler, WKNavigationDeleg
     /// On a first visit the site's bot check sets its cookies while the page loads, so the page's own data
     /// requests can come back empty. If no event list arrives, the page is reloaded (cookies and search state
     /// are in place by then), which is what a second manual search used to do.
-    private static let maxReloads = 2
+    private static let maxReloads = 3
     private static let reloadAfter: Duration = .seconds(9)
 
     private var webView: WKWebView?

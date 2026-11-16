@@ -6,7 +6,7 @@ final class EventsModel {
     enum Phase {
         case idle
         case loading(String?)
-        case loaded(GeoPoint, [LocalEvent])
+        case loaded(GeoPoint, [LocalEvent], batches: Int, candidates: Int)
         case failed(String, GeoPoint?)
     }
 
@@ -27,9 +27,9 @@ final class EventsModel {
                 point = p
                 guard !Task.isCancelled else { return }
                 phase = .loading(p.label)
-                let events = try await EventLocator.search(near: p, rangeMiles: range)
+                let result = try await EventLocator.search(near: p, rangeMiles: range)
                 guard !Task.isCancelled else { return }
-                withAnimation(.snappy) { phase = .loaded(p, events) }
+                withAnimation(.snappy) { phase = .loaded(p, result.events, batches: result.batches, candidates: result.candidates) }
             } catch is CancellationError {
                 return
             } catch let error as EventLocatorError {
@@ -54,7 +54,7 @@ struct EventsView: View {
     @Environment(\.openURL) private var openURL
 
     private var visible: [LocalEvent] {
-        guard case .loaded(_, let events) = model.phase else { return [] }
+        guard case .loaded(_, let events, _, _) = model.phase else { return [] }
         return events.filter { $0.matches(game: gameFilter, type: typeFilter) }
     }
 
@@ -101,7 +101,7 @@ struct EventsView: View {
 
     private func detailURL(for event: LocalEvent) -> URL {
         if let link = event.link, let url = URL(string: link) { return url }
-        if case .loaded(let p, _) = model.phase { return pokemonURL(p) }
+        if case .loaded(let p, _, _, _) = model.phase { return pokemonURL(p) }
         return URL(string: "https://events.pokemon.com/EventLocator/")!
     }
 
@@ -226,14 +226,10 @@ struct EventsView: View {
         case .failed(let message, let point):
             messageState(icon: "wifi.slash", title: "Couldn't load events", message: message,
                          retry: { model.search(query, range: range) }, url: point.map(pokemonURL))
-        case .loaded(let point, let events):
+        case .loaded(let point, let events, let batches, let candidates):
             if visible.isEmpty {
-                let filtered = gameFilter != .all || typeFilter != .all
-                let extra = filtered && !events.isEmpty
-                    ? " matching \(filterDescription). \(events.count) other event\(events.count == 1 ? "" : "s") hidden by filters."
-                    : ". Try a wider distance."
                 messageState(icon: "calendar.badge.exclamationmark", title: "No events found",
-                             message: "Nothing within \(range) mi of \(point.label)\(extra)",
+                             message: emptyMessage(point, events, candidates),
                              retry: nil, url: pokemonURL(point))
             } else {
                 Text("\(visible.count) event\(visible.count == 1 ? "" : "s") within \(range) mi of \(point.label)")
@@ -283,6 +279,17 @@ struct EventsView: View {
         .frame(maxWidth: .infinity)
         .padding(.top, 40)
         .padding(.horizontal, 24)
+    }
+
+    private func emptyMessage(_ point: GeoPoint, _ events: [LocalEvent], _ candidates: Int) -> String {
+        if candidates == 0 {
+            return "Pokémon's site responded but sent no event data — it may be busy or throttling this search. Try again in a minute."
+        }
+        let filtered = gameFilter != .all || typeFilter != .all
+        let extra = filtered && !events.isEmpty
+            ? " matching \(filterDescription). \(events.count) other event\(events.count == 1 ? "" : "s") hidden by filters."
+            : ". Try a wider distance."
+        return "Nothing within \(range) mi of \(point.label)\(extra)"
     }
 
     private func messageState(icon: String, title: String, message: String, retry: (() -> Void)?, url: URL?) -> some View {

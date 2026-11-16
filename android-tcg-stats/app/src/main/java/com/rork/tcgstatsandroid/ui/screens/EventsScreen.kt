@@ -104,7 +104,7 @@ import java.util.Locale
 sealed interface EventsPhase {
     data object Idle : EventsPhase
     data class Loading(val place: String?) : EventsPhase
-    data class Loaded(val place: GeoPoint, val events: List<LocalEvent>) : EventsPhase
+    data class Loaded(val place: GeoPoint, val events: List<LocalEvent>, val batches: Int, val candidates: Int) : EventsPhase
     data class Failed(val message: String, val place: GeoPoint?) : EventsPhase
 }
 
@@ -158,8 +158,8 @@ class EventsViewModel(app: Application) : AndroidViewModel(app) {
             try {
                 point = EventLocator.geocode(getApplication(), query)
                 _state.update { it.copy(phase = EventsPhase.Loading(point.label)) }
-                val events = EventLocator.search(activity, point, _state.value.range)
-                _state.update { it.copy(phase = EventsPhase.Loaded(point, events)) }
+                val result = EventLocator.search(activity, point, _state.value.range)
+                _state.update { it.copy(phase = EventsPhase.Loaded(point, result.events, result.batches, result.candidates)) }
             } catch (e: EventLocatorException) {
                 _state.update { it.copy(phase = EventsPhase.Failed(e.message ?: "Something went wrong.", point)) }
             } catch (e: kotlinx.coroutines.CancellationException) {
@@ -283,10 +283,14 @@ fun EventsScreen(modifier: Modifier = Modifier, vm: EventsViewModel = viewModel(
                             MessageState(
                                 icon = Icons.Filled.EventBusy,
                                 title = "No events found",
-                                message = "Nothing within ${state.range} mi of ${phase.place.label}" +
-                                    (if ((state.game != EventGameFilter.All || state.type != EventTypeFilter.All) && phase.events.isNotEmpty()) {
-                                        " matching ${filterDescription(state.game, state.type)}. ${phase.events.size} other event${if (phase.events.size == 1) "" else "s"} hidden by filters."
-                                    } else ". Try a wider distance."),
+                                message = if (phase.candidates == 0) {
+                                    "Pokémon's site responded but sent no event data — it may be busy or throttling this search. Try again in a minute."
+                                } else {
+                                    "Nothing within ${state.range} mi of ${phase.place.label}" +
+                                        (if ((state.game != EventGameFilter.All || state.type != EventTypeFilter.All) && phase.events.isNotEmpty()) {
+                                            " matching ${filterDescription(state.game, state.type)}. ${phase.events.size} other event${if (phase.events.size == 1) "" else "s"} hidden by filters."
+                                        } else ". Try a wider distance.")
+                                },
                                 primary = null,
                                 pokemonUrl = pokemonUrl,
                             )

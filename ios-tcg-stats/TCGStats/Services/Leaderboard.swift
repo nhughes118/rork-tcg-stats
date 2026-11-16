@@ -13,7 +13,7 @@ nonisolated enum Leaderboard {
     private static let api = "https://www.pokemon.com/us/play-pokemon/leaderboards/op/api/"
     private static let cacheTTL: TimeInterval = 12 * 3600
     private static let requestedPerPage = 100
-    private static let concurrency = 5
+    private static let concurrency = 8
     static let userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1"
 
     /// Known season ids (from the site's picker), used when the page can't be read.

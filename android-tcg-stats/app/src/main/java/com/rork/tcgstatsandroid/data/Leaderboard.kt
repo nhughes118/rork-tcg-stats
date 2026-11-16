@@ -103,7 +103,7 @@ object Leaderboard {
     private const val API = "https://www.pokemon.com/us/play-pokemon/leaderboards/op/api/"
     private const val CACHE_TTL_MS = 12 * 3_600_000L
     private const val REQUESTED_PER_PAGE = 100
-    private const val CONCURRENCY = 5
+    private const val CONCURRENCY = 8
 
     fun pageUrl(division: Division): String = division.pageUrl
 

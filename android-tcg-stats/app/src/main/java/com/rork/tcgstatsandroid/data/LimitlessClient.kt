@@ -16,12 +16,13 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.intOrNull
 import java.io.File
-import java.net.HttpURLConnection
-import java.net.URL
 import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.UUID
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import okhttp3.OkHttpClient
+import okhttp3.Request
 
 class LimitlessException(message: String) : Exception(message)
 
@@ -49,28 +50,42 @@ object LimitlessClient {
         explicitNulls = false
     }
 
+    /** One shared client: HTTP/2, pooled connections, transparent gzip. */
+    private val client: OkHttpClient by lazy {
+        OkHttpClient.Builder()
+            .connectTimeout(20, TimeUnit.SECONDS)
+            .readTimeout(30, TimeUnit.SECONDS)
+            .build()
+    }
+
     private data class Summary(val id: String, val name: String, val date: Long, val players: Int)
 
     suspend fun httpGet(url: String, accept: String, userAgent: String? = null): String = withContext(Dispatchers.IO) {
-        val conn = URL(url).openConnection() as HttpURLConnection
-        try {
-            conn.connectTimeout = 20_000
-            conn.readTimeout = 30_000
-            conn.setRequestProperty("Accept", accept)
-            userAgent?.let { conn.setRequestProperty("User-Agent", it) }
-            if (conn.responseCode !in 200..299) throw LimitlessException(BAD_RESPONSE)
-            // Reading to the end and closing (not disconnecting) returns the socket to the keep-alive pool.
-            conn.inputStream.bufferedReader().use { it.readText() }
-        } catch (e: Exception) {
-            conn.disconnect()
-            throw e
+        val request = Request.Builder()
+            .url(url)
+            .header("Accept", accept)
+            .apply { userAgent?.let { header("User-Agent", it) } }
+            .build()
+        client.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) throw LimitlessException(BAD_RESPONSE)
+            response.body?.string() ?: throw LimitlessException(BAD_RESPONSE)
         }
     }
 
+    private val ISO_FRACTION = Regex("\\.\\d+")
+
+    /** SimpleDateFormat is expensive to build and not thread-safe, so keep one set per thread. */
+    private val ISO_FORMATS = object : ThreadLocal<Array<SimpleDateFormat>>() {
+        override fun initialValue(): Array<SimpleDateFormat> =
+            arrayOf("yyyy-MM-dd'T'HH:mm:ssXXX", "yyyy-MM-dd'T'HH:mm:ss", "yyyy-MM-dd")
+                .map { SimpleDateFormat(it, Locale.US) }
+                .toTypedArray()
+    }
+
     fun parseIsoDate(s: String): Long? {
-        val cleaned = s.replace(Regex("\\.\\d+"), "")
-        for (pattern in listOf("yyyy-MM-dd'T'HH:mm:ssXXX", "yyyy-MM-dd'T'HH:mm:ss", "yyyy-MM-dd")) {
-            val parsed = runCatching { SimpleDateFormat(pattern, Locale.US).parse(cleaned)?.time }.getOrNull()
+        val cleaned = ISO_FRACTION.replace(s, "")
+        for (format in ISO_FORMATS.get()!!) {
+            val parsed = runCatching { format.parse(cleaned)?.time }.getOrNull()
             if (parsed != null) return parsed
         }
         return null
@@ -166,7 +181,7 @@ object LimitlessClient {
         if (selected.isEmpty()) throw LimitlessException(NO_DATA)
 
         val done = AtomicInteger(0)
-        val records = selected.mapConcurrent(6) { t ->
+        val records = selected.mapConcurrent(8) { t ->
             val record = runCatching { onlineRecord(context, t) }.getOrNull()
             progress(0.05 + 0.95 * done.incrementAndGet() / selected.size)
             record

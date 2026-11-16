@@ -200,6 +200,19 @@ nonisolated enum EventLocator {
         return !start.hasPrefix("1900")
     }
 
+    /** Counts event-shaped objects in a captured response body, to spot empty event lists. */
+    static func countEventObjects(in body: String) -> Int {
+        guard let data = body.data(using: .utf8), let root = try? JSONSerialization.jsonObject(with: data) else { return 0 }
+        func count(_ element: Any) -> Int {
+            if let obj = element as? [String: Any] {
+                return isEvent(obj) ? 1 : obj.values.reduce(0) { $0 + count($1) }
+            }
+            if let arr = element as? [Any] { return arr.reduce(0) { $0 + count($1) } }
+            return 0
+        }
+        return count(root)
+    }
+
     private static func makeEvent(_ o: [String: Any], parent: [String: Any]?, origin: GeoPoint) async -> LocalEvent? {
         guard let name = text(o, "name"),
               let startRaw = text(o, "start_datetime", "start_date", "startdate", "when") else { return nil }
@@ -214,7 +227,7 @@ nonisolated enum EventLocator {
         let distance = coords.map { haversineMiles(origin.latitude, origin.longitude, $0.0, $0.1) }
 
         let tzField = text(address, "timezone", "time_zone") ?? text(o, "timezone", "time_zone")
-        let explicit = hasOffset(startRaw)
+        let explicit = hasTrustedOffset(startRaw)
         lock.lock()
         let first = !loggedShape
         loggedShape = true
@@ -223,8 +236,9 @@ nonisolated enum EventLocator {
             let keys = o.keys.sorted().joined(separator: ",")
             print("[Events] first event: keys=[\(keys)] start=\(startRaw) tzField=\(tzField ?? "-") explicitOffset=\(explicit)")
         }
-        // Venue-local clock time, in order of trust: an explicit UTC offset in the string, the payload's own
-        // zone field, then the venue's zone looked up from its coordinates (falls back to UTC).
+        // Venue-local clock time, in order of trust: a non-zero UTC offset in the string (a zero offset is
+        // how the site stamps venue-local times, so it isn't trusted), the payload's own zone field, then
+        // the venue's zone looked up from its coordinates (falls back to UTC).
         var resolved = safeZone(tzField ?? "")
         if resolved == nil, let coords {
             resolved = await venueZone(lat: coords.0, lng: coords.1)
@@ -293,18 +307,31 @@ nonisolated enum EventLocator {
     /// True when the datetime string carries its own UTC offset (or a trailing Z).
     static func hasOffset(_ raw: String) -> Bool {
         let s = raw.trimmingCharacters(in: .whitespaces)
-        if s.hasSuffix("Z") { return true }
+        if s.hasSuffix("Z") || s.hasSuffix("z") { return true }
         return s.range(of: #"[+-]\d{2}:?\d{2}$"#, options: .regularExpression) != nil
+    }
+
+    /// True when the string carries a non-zero UTC offset — the only kind trusted outright. OutSystems
+    /// stamps venue-local wall times with a zero offset (a trailing Z or +00:00), so those are treated
+    /// as unmarked and interpreted in the venue's zone.
+    static func hasTrustedOffset(_ raw: String) -> Bool {
+        let s = raw.trimmingCharacters(in: .whitespaces)
+        if s.hasSuffix("Z") || s.hasSuffix("z") { return false }
+        guard let m = s.range(of: #"[+-]\d{2}:?\d{2}$"#, options: .regularExpression) else { return false }
+        let digits = s[m.lowerBound...].filter(\.isNumber)
+        return Int(digits) != 0
     }
 
     /// Returns the date and whether the source included a time of day.
     static func parseDate(_ raw: String, zone: String?) -> (Date, Bool)? {
         var s = raw.trimmingCharacters(in: .whitespaces).replacingOccurrences(of: " ", with: "T")
         s = s.replacingOccurrences(of: #"\.\d+"#, with: "", options: .regularExpression)
-        if s.hasSuffix("Z") { s = String(s.dropLast()) + "+00:00" }
+        if s.hasSuffix("Z") || s.hasSuffix("z") { s = String(s.dropLast()) + "+00:00" }
         if s.contains("T") {
             s = s.replacingOccurrences(of: #"([+-]\d{2})(\d{2})$"#, with: "$1:$2", options: .regularExpression)
         }
+        // A resolved venue zone outranks a zero offset (see hasTrustedOffset): read the wall clock in it.
+        if zone != nil { s = s.replacingOccurrences(of: #"[+-]00:00$"#, with: "", options: .regularExpression) }
         let tz = zone.flatMap(TimeZone.init(identifier:))
         func attempt(_ pattern: String, _ zone: TimeZone?, _ input: String) -> Date? {
             let f = DateFormatter()
@@ -354,7 +381,7 @@ nonisolated enum EventLocator {
         if let tz = zoneCache[key] { lock.unlock(); return tz }
         if zoneMisses.contains(key) { lock.unlock(); return nil }
         lock.unlock()
-        if let stored = UserDefaults.standard.string(forKey: zonePref + key) {
+        if let stored = UserDefaults.standard.string(forKey: zonePref + key), stored != "-" {
             guard let tz = safeZone(stored) else {
                 lock.lock(); zoneMisses.insert(key); lock.unlock()
                 return nil
@@ -371,8 +398,8 @@ nonisolated enum EventLocator {
         ]
         let id = (await getJSON(comps.url!) as? [String: Any])?["timezone"] as? String
         guard let id, let tz = safeZone(id) else {
+            // Only remember the miss in memory: a transient failure must not poison the zone on disk.
             lock.lock(); zoneMisses.insert(key); lock.unlock()
-            UserDefaults.standard.set("-", forKey: zonePref + key)
             return nil
         }
         lock.lock(); zoneCache[key] = tz; lock.unlock()
@@ -522,10 +549,19 @@ final class EventPageLoader: NSObject, WKScriptMessageHandler, WKNavigationDeleg
         captured.append(Captured(url: url, body: body))
         print("[Events] captured \(url.split(separator: "/").last ?? "") (\(body.count) bytes)")
         if url.localizedCaseInsensitiveContains("GetEventList") {
-            sawEventList = true
-            watchdogTask?.cancel()
-            // Event lists arrive in batches; finish once they go quiet.
-            scheduleFinish(after: .seconds(3))
+            // A cold session's first event list can come back empty while the site's bot check is still
+            // settling. Only accept it once it holds events, or after a reload — otherwise the reload
+            // below never happens and the search shows no results.
+            let events = EventLocator.countEventObjects(in: body)
+            if events > 0 || reloads >= 1 {
+                sawEventList = true
+                watchdogTask?.cancel()
+                // Event lists arrive in batches; finish once they go quiet.
+                scheduleFinish(after: .seconds(3))
+            } else {
+                print("[Events] event list came back empty; waiting for reload")
+                if reloads >= Self.maxReloads { scheduleFinish(after: .seconds(3)) }
+            }
         } else if url.localizedCaseInsensitiveContains("GetLocations") {
             sawLocations = true
             if reloads >= Self.maxReloads && !sawEventList { scheduleFinish(after: .seconds(10)) }

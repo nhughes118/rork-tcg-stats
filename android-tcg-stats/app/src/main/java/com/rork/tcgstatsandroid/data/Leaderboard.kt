@@ -243,7 +243,7 @@ object Leaderboard {
         }
 
         try {
-            val setup = web.open(division.pageUrl)
+            var setup = web.open(division.pageUrl)
             Log.d("Leaderboard", "${division.slug} page ready=${setup.ready} type=${setup.type} when=${setup.whenId} (${setup.whenLabel}) zone=${setup.zone}")
             Log.d("Leaderboard", "captured: ${setup.capturedUrl ?: "none"} body=${setup.capturedBody?.take(200) ?: "none"}")
             if (!setup.ready) {
@@ -253,21 +253,33 @@ object Leaderboard {
             var first: Page? = null
             var chosen: Pair<Template, Int?>? = null
             var responded = false
-            probe@ for (template in templates(division, region, setup)) {
-                // The site's own picker tops out at 100 rows; larger sizes come back empty, so never trust those.
-                val sizes: List<Int?> = listOf(REQUESTED_PER_PAGE, null)
-                for (size in sizes) {
-                    try {
-                        val page = fetchPage(template, 1, size, attempts = 2)
-                        responded = true
-                        Log.d("Leaderboard", "probe ${template.describe} per_page=${size ?: "page"} -> ${page.records.size} records, total ${page.total}")
-                        if (page.records.isNotEmpty()) { first = page; chosen = template to size; break@probe }
-                    } catch (e: CancellationException) {
-                        throw e
-                    } catch (e: Exception) {
-                        continue
-                    }
+            // The page's own request can come back as a block stub while the bot check settles. Two passes:
+            // after the first pass finds nothing, reload the page once for a fresh session and try again.
+            var round = 0
+            while (first == null && round < 2) {
+                if (round == 1) {
+                    Log.d("Leaderboard", "no data yet; reloading the page for a fresh session")
+                    setup = web.open(division.pageUrl)
+                    if (!setup.ready) break
                 }
+                for (template in templates(division, region, setup)) {
+                    // The site's own picker tops out at 100 rows; larger sizes come back empty, so never trust those.
+                    val sizes: List<Int?> = listOf(REQUESTED_PER_PAGE, null)
+                    for (size in sizes) {
+                        try {
+                            val page = fetchPage(template, 1, size, attempts = 2)
+                            responded = true
+                            Log.d("Leaderboard", "probe ${template.describe} per_page=${size ?: "page"} -> ${page.records.size} records, total ${page.total}")
+                            if (page.records.isNotEmpty()) { first = page; chosen = template to size; break }
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            continue
+                        }
+                    }
+                    if (first != null) break
+                }
+                round++
             }
             if (first == null || chosen == null) {
                 throw LeaderboardException(
@@ -324,6 +336,11 @@ object Leaderboard {
 
     private fun parse(text: String, page: Int): Page {
         val root = LimitlessClient.json.parseToJsonElement(text).jsonObject
+        // A bare {} (no leaderboard/records/_metadata) is the bot check's block stub, not an empty
+        // leaderboard — treat it like any other blocked response so the caller retries on a new session.
+        if (!root.containsKey("leaderboard") && !root.containsKey("records") && !root.containsKey("_metadata")) {
+            throw BlockedException()
+        }
         val board = root["leaderboard"] as? JsonObject
         val meta = (root["_metadata"] as? JsonObject) ?: (board?.get("_metadata") as? JsonObject)
         val boardMeta = board?.get("_metadata") as? JsonObject
@@ -432,54 +449,58 @@ object Leaderboard {
         private val pending = ConcurrentHashMap<Int, CompletableDeferred<String>>()
         private val ids = AtomicInteger(0)
         private var web: WebView? = null
-        private val ready = CompletableDeferred<Unit>()
+        private var ready = CompletableDeferred<Unit>()
 
         suspend fun open(url: String): PageSetup {
             withContext(Dispatchers.Main) {
                 // The hidden page sits on top of the app, so it must never receive touches: otherwise taps fall
                 // through to the site's own dropdowns (region / leaderboard type / season) and open their pickers.
-                val view = object : WebView(activity) {
-                    override fun dispatchTouchEvent(event: android.view.MotionEvent?): Boolean = false
-                    @SuppressLint("ClickableViewAccessibility")
-                    override fun onTouchEvent(event: android.view.MotionEvent?): Boolean = false
-                    override fun dispatchGenericMotionEvent(event: android.view.MotionEvent?): Boolean = false
-                }
-                view.isClickable = false
-                view.isLongClickable = false
-                view.isFocusable = false
-                view.isFocusableInTouchMode = false
-                view.importantForAccessibility = android.view.View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
-                view.settings.javaScriptEnabled = true
-                view.settings.domStorageEnabled = true
-                view.settings.loadsImagesAutomatically = false
-                CookieManager.getInstance().setAcceptCookie(true)
-                CookieManager.getInstance().setAcceptThirdPartyCookies(view, true)
-                view.addJavascriptInterface(object {
-                    @JavascriptInterface
-                    fun post(id: Int, body: String) {
-                        pending.remove(id)?.complete(body)
+                if (web == null) {
+                    val view = object : WebView(activity) {
+                        override fun dispatchTouchEvent(event: android.view.MotionEvent?): Boolean = false
+                        @SuppressLint("ClickableViewAccessibility")
+                        override fun onTouchEvent(event: android.view.MotionEvent?): Boolean = false
+                        override fun dispatchGenericMotionEvent(event: android.view.MotionEvent?): Boolean = false
                     }
-                }, "TCGLeaderboard")
-                val documentStart = WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)
-                if (documentStart) {
-                    runCatching { WebViewCompat.addDocumentStartJavaScript(view, HOOK_JS, setOf("https://www.pokemon.com")) }
-                }
-                view.webViewClient = object : WebViewClient() {
-                    override fun onPageStarted(v: WebView, u: String?, favicon: android.graphics.Bitmap?) {
-                        if (!documentStart) v.evaluateJavascript(HOOK_JS, null)
+                    view.isClickable = false
+                    view.isLongClickable = false
+                    view.isFocusable = false
+                    view.isFocusableInTouchMode = false
+                    view.importantForAccessibility = android.view.View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
+                    view.settings.javaScriptEnabled = true
+                    view.settings.domStorageEnabled = true
+                    view.settings.loadsImagesAutomatically = false
+                    CookieManager.getInstance().setAcceptCookie(true)
+                    CookieManager.getInstance().setAcceptThirdPartyCookies(view, true)
+                    view.addJavascriptInterface(object {
+                        @JavascriptInterface
+                        fun post(id: Int, body: String) {
+                            pending.remove(id)?.complete(body)
+                        }
+                    }, "TCGLeaderboard")
+                    val documentStart = WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)
+                    if (documentStart) {
+                        runCatching { WebViewCompat.addDocumentStartJavaScript(view, HOOK_JS, setOf("https://www.pokemon.com")) }
                     }
+                    view.webViewClient = object : WebViewClient() {
+                        override fun onPageStarted(v: WebView, u: String?, favicon: android.graphics.Bitmap?) {
+                            if (!documentStart) v.evaluateJavascript(HOOK_JS, null)
+                        }
 
-                    override fun onPageFinished(v: WebView, u: String?) {
-                        // The bot check serves an interstitial that reloads itself; the real page has the rankings container.
-                        v.evaluateJavascript("(function(){return !!document.querySelector('#stats-leaderboards-selected-rankings') && !!window.jQuery;})()") { r ->
-                            if (r == "true") ready.complete(Unit)
+                        override fun onPageFinished(v: WebView, u: String?) {
+                            // The bot check serves an interstitial that reloads itself; the real page has the rankings container.
+                            v.evaluateJavascript("(function(){return !!document.querySelector('#stats-leaderboards-selected-rankings') && !!window.jQuery;})()") { r ->
+                                if (r == "true") ready.complete(Unit)
+                            }
                         }
                     }
+                    view.alpha = 0.01f
+                    (activity.window.decorView as ViewGroup).addView(view, FrameLayout.LayoutParams(390, 844))
+                    web = view
                 }
-                view.alpha = 0.01f
-                (activity.window.decorView as ViewGroup).addView(view, FrameLayout.LayoutParams(390, 844))
-                web = view
-                view.loadUrl(url)
+                // A reload starts a fresh session, so re-arm the ready signal before loading.
+                ready = CompletableDeferred()
+                web?.loadUrl(url)
             }
             withTimeoutOrNull(30_000) { ready.await() } ?: return PageSetup(ready = false)
 

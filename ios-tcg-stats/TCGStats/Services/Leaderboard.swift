@@ -136,6 +136,12 @@ nonisolated enum Leaderboard {
             return await f.open(division.pageURL)
         }
 
+        /// Reloads the page in the existing web view for a fresh bot-check session.
+        func reopen(_ division: Division) async -> PageSetup {
+            guard let fetcher else { return await prepare(division) }
+            return await fetcher.open(division.pageURL)
+        }
+
         func text(_ url: URL) async -> String {
             guard let fetcher else { return "" }
             return await fetcher.get(url)
@@ -188,7 +194,7 @@ nonisolated enum Leaderboard {
         _ region: LeaderboardRegion,
         onProgress: @escaping @Sendable ([LeaderboardPlayer], Int) async -> Void
     ) async throws -> LeaderboardIndex {
-        let setup = await session.prepare(division)
+        var setup = await session.prepare(division)
         print("[Leaderboard] \(division.rawValue) page ready=\(setup.ready) type=\(setup.type ?? "-") when=\(setup.when ?? "-") (\(setup.whenLabel ?? "-")) zone=\(setup.zone ?? "-")")
         print("[Leaderboard] captured: \(setup.capturedURL ?? "none") body=\(setup.capturedBody?.prefix(200) ?? "none")")
         guard setup.ready else {
@@ -198,21 +204,33 @@ nonisolated enum Leaderboard {
         var first: Page?
         var chosen: (URLComponents, Int?)?
         var responded = false
-        probe: for template in templates(division, region, setup) {
-            // The site's own picker tops out at 100 rows; larger sizes come back empty, so never trust those.
-            let sizes: [Int?] = [requestedPerPage, nil]
-            for size in sizes {
-                do {
-                    let page = try await fetchPage(session, template, page: 1, perPage: size, attempts: 2)
-                    responded = true
-                    print("[Leaderboard] probe \(template.string ?? "") per_page=\(size.map(String.init) ?? "page") -> \(page.records.count) records, total \(page.total ?? -1)")
-                    if !page.records.isEmpty { first = page; chosen = (template, size); break probe }
-                } catch is CancellationError {
-                    throw CancellationError()
-                } catch {
-                    continue
-                }
+        // The page's own request can come back as a block stub while the bot check settles. Two passes:
+        // after the first pass finds nothing, reload the page once for a fresh session and try again.
+        var round = 0
+        while first == nil && round < 2 {
+            if round == 1 {
+                print("[Leaderboard] no data yet; reloading the page for a fresh session")
+                setup = await session.reopen(division)
+                guard setup.ready else { break }
             }
+            for template in templates(division, region, setup) {
+                // The site's own picker tops out at 100 rows; larger sizes come back empty, so never trust those.
+                let sizes: [Int?] = [requestedPerPage, nil]
+                for size in sizes {
+                    do {
+                        let page = try await fetchPage(session, template, page: 1, perPage: size, attempts: 2)
+                        responded = true
+                        print("[Leaderboard] probe \(template.string ?? "") per_page=\(size.map(String.init) ?? "page") -> \(page.records.count) records, total \(page.total ?? -1)")
+                        if !page.records.isEmpty { first = page; chosen = (template, size); break }
+                    } catch is CancellationError {
+                        throw CancellationError()
+                    } catch {
+                        continue
+                    }
+                }
+                if first != nil { break }
+            }
+            round += 1
         }
         guard let first, let chosen else {
             let diag = "page \(setup.capturedURL == nil ? "sent no request" : "request seen"), season \(setup.whenLabel ?? "?")"
@@ -264,6 +282,9 @@ nonisolated enum Leaderboard {
     private static func parse(_ text: String, page: Int) -> Page? {
         guard let data = text.data(using: .utf8),
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        // A bare {} (no leaderboard/records/_metadata) is the bot check's block stub, not an empty
+        // leaderboard — returning nil makes the caller treat it like any other blocked response.
+        guard root["leaderboard"] != nil || root["records"] != nil || root["_metadata"] != nil else { return nil }
         let board = root["leaderboard"] as? [String: Any]
         let meta = (root["_metadata"] as? [String: Any]) ?? (board?["_metadata"] as? [String: Any])
         let boardMeta = board?["_metadata"] as? [String: Any]
@@ -393,21 +414,28 @@ final class LeaderboardWebFetcher: NSObject, WKNavigationDelegate {
     """
 
     func open(_ url: URL) async -> Leaderboard.PageSetup {
-        let config = WKWebViewConfiguration()
-        config.websiteDataStore = .default()
-        config.userContentController.addUserScript(WKUserScript(source: Self.hook, injectionTime: .atDocumentStart, forMainFrameOnly: true))
-        let web = WKWebView(frame: CGRect(x: 0, y: 0, width: 390, height: 844), configuration: config)
-        web.alpha = 0.01
-        web.isUserInteractionEnabled = false
-        web.navigationDelegate = self
-        webView = web
-        UIApplication.shared.connectedScenes
-            .compactMap { ($0 as? UIWindowScene)?.keyWindow }
-            .first?
-            .addSubview(web)
+        var setup = Leaderboard.PageSetup()
+        let web: WKWebView
+        if let existing = webView {
+            web = existing
+        } else {
+            let config = WKWebViewConfiguration()
+            config.websiteDataStore = .default()
+            config.userContentController.addUserScript(WKUserScript(source: Self.hook, injectionTime: .atDocumentStart, forMainFrameOnly: true))
+            let created = WKWebView(frame: CGRect(x: 0, y: 0, width: 390, height: 844), configuration: config)
+            created.alpha = 0.01
+            created.isUserInteractionEnabled = false
+            created.navigationDelegate = self
+            webView = created
+            UIApplication.shared.connectedScenes
+                .compactMap { ($0 as? UIWindowScene)?.keyWindow }
+                .first?
+                .addSubview(created)
+            web = created
+        }
+        // A reload starts a fresh session; the hook script is re-injected with the new document.
         web.load(URLRequest(url: url))
 
-        var setup = Leaderboard.PageSetup()
         // The bot check serves an interstitial that reloads itself; the real page has the rankings container.
         let deadline = Date().addingTimeInterval(30)
         while Date() < deadline {

@@ -214,7 +214,7 @@ nonisolated enum EventLocator {
         let distance = coords.map { haversineMiles(origin.latitude, origin.longitude, $0.0, $0.1) }
 
         let tzField = text(address, "timezone", "time_zone") ?? text(o, "timezone", "time_zone")
-        let explicit = hasOffset(startRaw)
+        let explicit = hasTrustedOffset(startRaw)
         lock.lock()
         let first = !loggedShape
         loggedShape = true
@@ -223,8 +223,9 @@ nonisolated enum EventLocator {
             let keys = o.keys.sorted().joined(separator: ",")
             print("[Events] first event: keys=[\(keys)] start=\(startRaw) tzField=\(tzField ?? "-") explicitOffset=\(explicit)")
         }
-        // Venue-local clock time, in order of trust: an explicit UTC offset in the string, the payload's own
-        // zone field, then the venue's zone looked up from its coordinates (falls back to UTC).
+        // Venue-local clock time, in order of trust: a non-zero UTC offset in the string (a zero offset is
+        // how the site stamps venue-local times, so it isn't trusted), the payload's own zone field, then
+        // the venue's zone looked up from its coordinates (falls back to UTC).
         var resolved = safeZone(tzField ?? "")
         if resolved == nil, let coords {
             resolved = await venueZone(lat: coords.0, lng: coords.1)
@@ -290,20 +291,27 @@ nonisolated enum EventLocator {
         return .other
     }
 
-    /// True when the datetime string carries its own UTC offset (or a trailing Z).
-    static func hasOffset(_ raw: String) -> Bool {
+    /// True when the datetime string carries a non-zero UTC offset — the only kind trusted outright.
+    /// OutSystems stamps venue-local wall times with a zero offset (a trailing Z or +00:00), so those
+    /// are treated as unmarked and interpreted in the venue's zone.
+    static func hasTrustedOffset(_ raw: String) -> Bool {
         let s = raw.trimmingCharacters(in: .whitespaces)
-        if s.hasSuffix("Z") { return true }
-        return s.range(of: #"[+-]\d{2}:?\d{2}$"#, options: .regularExpression) != nil
+        guard let m = s.range(of: #"([+-])(\d{2}):?(\d{2})$"#, options: .regularExpression) else { return false }
+        let digits = String(s[m.lowerBound...].filter { $0.isNumber })
+        return digits.prefix(2) != "00" || digits.suffix(2) != "00"
     }
 
     /// Returns the date and whether the source included a time of day.
     static func parseDate(_ raw: String, zone: String?) -> (Date, Bool)? {
         var s = raw.trimmingCharacters(in: .whitespaces).replacingOccurrences(of: " ", with: "T")
         s = s.replacingOccurrences(of: #"\.\d+"#, with: "", options: .regularExpression)
-        if s.hasSuffix("Z") { s = String(s.dropLast()) + "+00:00" }
+        if s.hasSuffix("Z") || s.hasSuffix("z") { s = String(s.dropLast()) + "+00:00" }
         if s.contains("T") {
             s = s.replacingOccurrences(of: #"([+-]\d{2})(\d{2})$"#, with: "$1:$2", options: .regularExpression)
+        }
+        // A resolved venue zone outranks a zero offset (see hasTrustedOffset): read the wall clock in it.
+        if zone != nil {
+            s = s.replacingOccurrences(of: #"[+-]00:00$"#, with: "", options: .regularExpression)
         }
         let tz = zone.flatMap(TimeZone.init(identifier:))
         func attempt(_ pattern: String, _ zone: TimeZone?, _ input: String) -> Date? {

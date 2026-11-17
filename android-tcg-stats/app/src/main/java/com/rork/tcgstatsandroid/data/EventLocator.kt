@@ -443,12 +443,13 @@ object EventLocator {
         val distance = if (validCoords) haversineMiles(origin.latitude, origin.longitude, lat!!, lng!!) else null
 
         val tzField = address?.text("timezone", "time_zone") ?: o.text("timezone", "time_zone")
-        val explicit = hasOffset(startRaw)
+        val explicit = hasTrustedOffset(startRaw)
         if (loggedShape.compareAndSet(false, true)) {
             Log.d("Events", "first event: keys=[${o.keys.joinToString(",")}] start=$startRaw tzField=$tzField explicitOffset=$explicit")
         }
-        // Venue-local clock time, in order of trust: an explicit UTC offset in the string, the payload's own
-        // zone field, then the venue's zone looked up from its coordinates (falls back to UTC).
+        // Venue-local clock time, in order of trust: a non-zero UTC offset in the string (a zero offset is
+        // how the site stamps venue-local times, so it isn't trusted), the payload's own zone field, then
+        // the venue's zone looked up from its coordinates (falls back to UTC).
         val zone = if (explicit) null else tzField?.let(::safeZone)
             ?: (if (validCoords) venueZone(lat!!, lng!!, prefs) else null)
         val (millis, hasTime) = parseDate(startRaw, zone?.id ?: tzField) ?: (null to false)
@@ -515,13 +516,28 @@ object EventLocator {
         return Regex("[+-]\\d{2}:?\\d{2}$").containsMatchIn(s)
     }
 
+    /**
+     * True when the string carries a non-zero UTC offset — the only kind trusted outright. OutSystems
+     * stamps venue-local wall times with a zero offset (a trailing Z or +00:00), so those are treated
+     * as unmarked and interpreted in the venue's zone.
+     */
+    fun hasTrustedOffset(raw: String): Boolean {
+        val s = raw.trim()
+        Regex("([+-])(\\d{2}):?(\\d{2})$").find(s)?.let { m ->
+            return m.groupValues[2].toInt() != 0 || m.groupValues[3].toInt() != 0
+        }
+        return false
+    }
+
     /** Returns epoch millis and whether the source included a time of day. */
     fun parseDate(raw: String, zone: String?): Pair<Long, Boolean>? {
         var s = raw.trim().replace(" ", "T").replace(Regex("\\.\\d+"), "")
-        if (s.endsWith("Z")) s = s.dropLast(1) + "+00:00"
+        if (s.endsWith("Z") || s.endsWith("z")) s = s.dropLast(1) + "+00:00"
         if (s.contains("T")) {
             Regex("([+-]\\d{2})(\\d{2})$").find(s)?.let { m -> s = s.replaceRange(m.range, "${m.groupValues[1]}:${m.groupValues[2]}") }
         }
+        // A resolved venue zone outranks a zero offset (see hasTrustedOffset): read the wall clock in it.
+        if (zone != null) s = s.replace(Regex("[+-]00:00$"), "")
         val tz = zone?.let { TimeZone.getTimeZone(it) } ?: TimeZone.getTimeZone("UTC")
         val withOffset = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssXXX", Locale.US)
         runCatching { withOffset.parse(s)?.time }.getOrNull()?.let { return it to true }
@@ -564,8 +580,9 @@ object EventLocator {
         val (key, center) = zoneCell(lat, lng)
         zoneCache[key]?.let { return it }
         if (zoneMisses.contains(key)) return null
-        prefs?.getString(ZONE_PREF + key, null)?.let { stored ->
-            return safeZone(stored)?.also { zoneCache[key] = it } ?: run { zoneMisses.add(key); null }
+        // A stored "-" is a legacy failed lookup; ignore it so the zone can resolve on a later search.
+        prefs?.getString(ZONE_PREF + key, null)?.takeIf { it != "-" }?.let { stored ->
+            safeZone(stored)?.let { zoneCache[key] = it; return it }
         }
         val body = runCatching {
             LimitlessClient.httpGet(
@@ -583,8 +600,8 @@ object EventLocator {
             zoneCache[key] = tz
             prefs?.edit()?.putString(ZONE_PREF + key, tz.id)?.apply()
         } else {
+            // Only remember the miss in memory: a transient failure must not poison the zone on disk.
             zoneMisses.add(key)
-            prefs?.edit()?.putString(ZONE_PREF + key, "-")?.apply()
         }
         return tz
     }

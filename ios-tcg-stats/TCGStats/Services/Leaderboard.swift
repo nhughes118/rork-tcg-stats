@@ -147,6 +147,11 @@ nonisolated enum Leaderboard {
             return await fetcher.get(url)
         }
 
+        func selectZone(_ zone: String) async -> (String, String)? {
+            guard let fetcher else { return nil }
+            return await fetcher.selectZone(zone)
+        }
+
         func close() async {
             if let fetcher { await fetcher.close() }
             fetcher = nil
@@ -204,6 +209,30 @@ nonisolated enum Leaderboard {
         var first: Page?
         var chosen: (URLComponents, Int?)?
         var responded = false
+
+        // Best path: use the page's own request and response — the exact traffic a visitor's browser
+        // generates, which the bot check already lets through. Only fall back to replaying requests
+        // ourselves when the page's own response isn't usable for the requested region.
+        func shaped(_ url: String?, _ body: String?) -> (URLComponents, Page)? {
+            guard let url, let body, body.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("{"),
+                  let template = URLComponents(string: url),
+                  let page = parse(body, page: 1), !page.records.isEmpty else { return nil }
+            return (template, page)
+        }
+        if let (t, p) = shaped(setup.capturedURL, setup.capturedBody),
+           t.queryItems?.first(where: { $0.name == "zone" })?.value == region.rawValue {
+            first = p
+            chosen = (t, t.queryItems?.first(where: { $0.name == "per_page" })?.value.flatMap { Int($0) })
+        }
+        if first == nil {
+            let sel = await session.selectZone(region.rawValue)
+            print("[Leaderboard] driven: \(sel?.0 ?? "none") body=\(sel?.1.prefix(120) ?? "none")")
+            if let (t, p) = shaped(sel?.0, sel?.1) {
+                first = p
+                chosen = (t, t.queryItems?.first(where: { $0.name == "per_page" })?.value.flatMap { Int($0) })
+            }
+        }
+
         // The page's own request can come back as a block stub while the bot check settles. Two passes:
         // after the first pass finds nothing, reload the page once for a fresh session and try again.
         var round = 0
@@ -404,7 +433,7 @@ final class LeaderboardWebFetcher: NSObject, WKNavigationDelegate {
     const opt = w && w.selectedIndex >= 0 ? w.options[w.selectedIndex] : null;
     return JSON.stringify({
       url: r ? r.url : null,
-      body: r && r.body ? r.body.slice(0, 4000) : null,
+      body: r && r.body ? r.body.slice(0, 500000) : null,
       type: val('leaderboardTypeFilter'),
       zone: val('leaderboardZoneFilter'),
       when: w ? w.value : null,
@@ -412,6 +441,34 @@ final class LeaderboardWebFetcher: NSObject, WKNavigationDelegate {
       options: w ? Array.from(w.options).map(o => [o.value, o.text.trim()]) : []
     });
     """
+
+    /// Flips the page's own zone dropdown so its script issues the request itself; reports that request and response.
+    func selectZone(_ zone: String) async -> (String, String)? {
+        guard let web = webView else { return nil }
+        let js = """
+        const s = document.getElementById('leaderboardZoneFilter');
+        if (!s) return {url: null, body: null};
+        const has = Array.from(s.options).some(function(o){ return o.value === zone; });
+        if (!has) return {url: null, body: null};
+        const before = (window.__lbReqs || []).length;
+        if (s.value !== zone) { s.value = zone; s.dispatchEvent(new Event('change', {bubbles: true})); }
+        for (let i = 0; i < 40; i++) {
+          const reqs = (window.__lbReqs || []);
+          for (let j = before; j < reqs.length; j++) {
+            const r = reqs[j];
+            if (r.url.indexOf('isUserStats') < 0 && r.body !== null) {
+              return {url: r.url, body: String(r.body).slice(0, 500000)};
+            }
+          }
+          await new Promise(function(res){ setTimeout(res, 500); });
+        }
+        return {url: null, body: null};
+        """
+        guard let o = try? await web.callAsyncJavaScript(js, arguments: ["zone": zone], in: nil, contentWorld: .page) as? [String: Any],
+              let u = o["url"] as? String, !u.isEmpty else { return nil }
+        let body = (o["body"] as? String) ?? ""
+        return (u, body)
+    }
 
     func open(_ url: URL) async -> Leaderboard.PageSetup {
         var setup = Leaderboard.PageSetup()
@@ -468,11 +525,18 @@ final class LeaderboardWebFetcher: NSObject, WKNavigationDelegate {
         return setup
     }
 
+    /// Same request a visitor's page makes: through the page's own jQuery (same fingerprint), fetch as fallback.
     func get(_ url: URL) async -> String {
         guard let web = webView else { return "" }
         let js = """
-        const r = await fetch(url, {credentials: 'include', __lbOwn: true, headers: {'Accept': 'application/json, text/javascript, */*; q=0.01', 'X-Requested-With': 'XMLHttpRequest'}});
-        return await r.text();
+        return await new Promise(function(res){
+          if (window.jQuery) {
+            window.jQuery.ajax({url: url, dataType: 'text', success: function(d){ res(d); }, error: function(){ res(''); }});
+          } else {
+            fetch(url, {credentials: 'include', __lbOwn: true, headers: {'Accept': 'application/json, text/javascript, */*; q=0.01', 'X-Requested-With': 'XMLHttpRequest'}})
+              .then(function(r){ return r.text(); }).then(res, function(){ res(''); });
+          }
+        });
         """
         let result = try? await web.callAsyncJavaScript(js, arguments: ["url": url.absoluteString], in: nil, contentWorld: .page)
         return (result as? String) ?? ""

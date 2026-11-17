@@ -253,6 +253,28 @@ object Leaderboard {
             var first: Page? = null
             var chosen: Pair<Template, Int?>? = null
             var responded = false
+
+            // Best path: use the page's own request and response — the exact traffic a visitor's browser
+            // generates, which the bot check already lets through. Only fall back to replaying requests
+            // ourselves when the page's own response isn't usable for the requested region.
+            fun shaped(url: String?, body: String?): Pair<Template, Page>? {
+                if (url == null || body.isNullOrEmpty() || !body.trimStart().startsWith("{")) return null
+                val template = Template.parse(url) ?: return null
+                val page = runCatching { parse(body, 1) }.getOrNull() ?: return null
+                if (page.records.isEmpty()) return null
+                return template to page
+            }
+            shaped(setup.capturedUrl, setup.capturedBody)
+                ?.takeIf { (t, _) -> t.param("zone") == region.zone }
+                ?.let { (t, p) -> first = p; chosen = t to t.param("per_page")?.toIntOrNull() }
+            if (first == null) {
+                val sel = web.selectZone(region.zone)
+                Log.d("Leaderboard", "driven: ${sel?.first ?: "none"} body=${sel?.second?.take(120) ?: "none"}")
+                shaped(sel?.first, sel?.second)?.let { (t, p) ->
+                    first = p; chosen = t to t.param("per_page")?.toIntOrNull()
+                }
+            }
+
             // The page's own request can come back as a block stub while the bot check settles. Two passes:
             // after the first pass finds nothing, reload the page once for a fresh session and try again.
             var round = 0
@@ -432,13 +454,37 @@ object Leaderboard {
       const opt = w && w.selectedIndex >= 0 ? w.options[w.selectedIndex] : null;
       return JSON.stringify({
         url: r ? r.url : null,
-        body: r && r.body ? r.body.slice(0, 4000) : null,
+        body: r && r.body ? r.body.slice(0, 500000) : null,
         type: val('leaderboardTypeFilter'),
         zone: val('leaderboardZoneFilter'),
         when: w ? w.value : null,
         whenLabel: opt ? opt.text.trim() : null,
         options: w ? Array.from(w.options).map(o => [o.value, o.text.trim()]) : []
       });
+    })()
+    """
+
+    /** Flips the page's own zone dropdown so its script issues the request itself; reports that request and response. */
+    private const val SELECT_JS = """
+    (async function(){
+      const zone = '__ZONE__';
+      const s = document.getElementById('leaderboardZoneFilter');
+      if (!s) return JSON.stringify({url: null, body: null});
+      const has = Array.from(s.options).some(o => o.value === zone);
+      if (!has) return JSON.stringify({url: null, body: null});
+      const before = (window.__lbReqs || []).length;
+      if (s.value !== zone) { s.value = zone; s.dispatchEvent(new Event('change', {bubbles: true})); }
+      for (let i = 0; i < 40; i++) {
+        const reqs = (window.__lbReqs || []);
+        for (let j = before; j < reqs.length; j++) {
+          const r = reqs[j];
+          if (r.url.indexOf('isUserStats') < 0 && r.body !== null) {
+            return JSON.stringify({url: r.url, body: r.body.slice(0, 500000)});
+          }
+        }
+        await new Promise(res => setTimeout(res, 500));
+      }
+      return JSON.stringify({url: null, body: null});
     })()
     """
 
@@ -540,8 +586,22 @@ object Leaderboard {
             return withTimeoutOrNull(timeoutMs) { deferred.await() } ?: run { pending.remove(id); "" }
         }
 
+        /** Changes the page's own zone dropdown so its script issues the request itself; returns that request and response. */
+        suspend fun selectZone(zone: String): Pair<String, String>? {
+            val json = runAsync(SELECT_JS.replace("__ZONE__", zone), 30_000)
+            val o = runCatching { LimitlessClient.json.parseToJsonElement(json).jsonObject }.getOrNull() ?: return null
+            fun s(k: String) = (o[k] as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotEmpty() }
+            val url = s("url") ?: return null
+            val body = (o["body"] as? JsonPrimitive)?.contentOrNull ?: return null
+            return url to body
+        }
+
+        /** Same request a visitor's page makes: through the page's own jQuery (same fingerprint), fetch as fallback. */
         suspend fun get(url: String): String = runAsync(
-            "fetch(${jsString(url)}, {credentials:'include', headers:{'Accept':'application/json, text/javascript, */*; q=0.01','X-Requested-With':'XMLHttpRequest'}}).then(function(r){return r.text();})",
+            "new Promise(function(res){ var u = ${jsString(url)};" +
+                " if (window.jQuery) { window.jQuery.ajax({url: u, dataType: 'text', success: function(d){res(d);}, error: function(){res('');}}); }" +
+                " else { fetch(u, {credentials:'include', headers:{'Accept':'application/json, text/javascript, */*; q=0.01','X-Requested-With':'XMLHttpRequest'}})" +
+                ".then(function(r){return r.text();}).then(res, function(){res('');}); } })",
             30_000,
         )
 

@@ -306,6 +306,32 @@ object Leaderboard {
                 }
                 round++
             }
+
+            // Last resort: show the real page and let the user pass Pokémon's check by hand. The hook keeps
+            // recording; as soon as the page itself receives leaderboard data, we harvest it and continue.
+            if (first == null) {
+                Log.d("Leaderboard", "all automatic attempts blocked; showing the page for the user to verify")
+                web.showInteractive()
+                try {
+                    val deadline = System.currentTimeMillis() + 150_000L
+                    while (first == null && System.currentTimeMillis() < deadline) {
+                        delay(1_500L)
+                        val got = runCatching { web.captured() }.getOrNull() ?: continue
+                        shaped(got.first, got.second)?.let { (t, p) ->
+                            if (t.param("zone") == region.zone) {
+                                first = p; chosen = t to t.param("per_page")?.toIntOrNull()
+                            } else {
+                                val sel = runCatching { web.selectZone(region.zone) }.getOrNull()
+                                shaped(sel?.first, sel?.second)?.let { (t2, p2) ->
+                                    first = p2; chosen = t2 to t2.param("per_page")?.toIntOrNull()
+                                }
+                            }
+                        }
+                    }
+                } finally {
+                    web.hideInteractive()
+                }
+            }
             if (first == null || chosen == null) {
                 throw LeaderboardException(
                     if (responded) "The ${division.label} ${if (region == LeaderboardRegion.Global) "" else "${region.label} "}leaderboard came back empty (page ${if (setup.capturedUrl == null) "sent no request" else "request seen"}, season ${setup.whenLabel ?: "?"})."
@@ -444,7 +470,9 @@ object Leaderboard {
     (async function(){
       const pick = () => {
         const reqs = (window.__lbReqs || []).filter(r => r.url.indexOf('isUserStats') < 0);
-        return reqs.length ? reqs[reqs.length - 1] : null;
+        let best = null;
+        for (const r of reqs) if (r.body !== null && (!best || r.body.length > best.body.length)) best = r;
+        return best || reqs[reqs.length - 1] || null;
       };
       for (let i = 0; i < 30; i++) {
         const r = pick();
@@ -492,6 +520,16 @@ object Leaderboard {
     })()
     """
 
+    /** The captured request with the largest response — used to poll while the user passes the check. */
+    private const val BEST_JS = """
+    (function(){
+      const reqs = (window.__lbReqs || []).filter(r => r.url.indexOf('isUserStats') < 0);
+      let best = null;
+      for (const r of reqs) if (r.body && (!best || r.body.length > best.body.length)) best = r;
+      return JSON.stringify({url: best ? best.url : null, body: best ? best.body.slice(0, 500000) : null});
+    })()
+    """
+
     /** Passes the site's bot check in a real browser context, then issues same-origin fetches from the page. */
     @SuppressLint("SetJavaScriptEnabled", "JavascriptInterface")
     private class WebFetcher(private val activity: Activity) {
@@ -501,16 +539,22 @@ object Leaderboard {
         private var web: WebView? = null
         private var ready = CompletableDeferred<Unit>()
 
+        /** False while hidden (never touches); true in the manual-verify fallback where the user drives the page. */
+        @Volatile private var interactive = false
+
         suspend fun open(url: String): PageSetup {
             withContext(Dispatchers.Main) {
                 // The hidden page sits on top of the app, so it must never receive touches: otherwise taps fall
                 // through to the site's own dropdowns (region / leaderboard type / season) and open their pickers.
                 if (web == null) {
                     val view = object : WebView(activity) {
-                        override fun dispatchTouchEvent(event: android.view.MotionEvent?): Boolean = false
+                        override fun dispatchTouchEvent(event: android.view.MotionEvent?): Boolean =
+                            if (interactive) super.dispatchTouchEvent(event) else false
                         @SuppressLint("ClickableViewAccessibility")
-                        override fun onTouchEvent(event: android.view.MotionEvent?): Boolean = false
-                        override fun dispatchGenericMotionEvent(event: android.view.MotionEvent?): Boolean = false
+                        override fun onTouchEvent(event: android.view.MotionEvent?): Boolean =
+                            if (interactive) super.onTouchEvent(event) else false
+                        override fun dispatchGenericMotionEvent(event: android.view.MotionEvent?): Boolean =
+                            if (interactive) super.dispatchGenericMotionEvent(event) else false
                     }
                     view.isClickable = false
                     view.isLongClickable = false
@@ -601,6 +645,43 @@ object Leaderboard {
             val url = s("url") ?: return null
             val body = (o["body"] as? JsonPrimitive)?.contentOrNull ?: return null
             return url to body
+        }
+
+        /** The captured request with the largest response so far, as (url, body). */
+        suspend fun captured(): Pair<String, String>? {
+            val json = runAsync(BEST_JS, 10_000)
+            val o = runCatching { LimitlessClient.json.parseToJsonElement(json).jsonObject }.getOrNull() ?: return null
+            fun s(k: String) = (o[k] as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotEmpty() }
+            val url = s("url") ?: return null
+            val body = (o["body"] as? JsonPrimitive)?.contentOrNull ?: return null
+            return url to body
+        }
+
+        /** Manual-verify fallback: shows the real page so the user can pass Pokémon's check by hand. */
+        suspend fun showInteractive() {
+            withContext(Dispatchers.Main) {
+                interactive = true
+                web?.let {
+                    it.alpha = 1f
+                    it.layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+                    it.bringToFront()
+                    android.widget.Toast.makeText(
+                        activity,
+                        "If Pokémon shows a security check, pass it — the leaderboard will load automatically.",
+                        android.widget.Toast.LENGTH_LONG,
+                    ).show()
+                }
+            }
+        }
+
+        suspend fun hideInteractive() {
+            withContext(Dispatchers.Main) {
+                interactive = false
+                web?.let {
+                    it.alpha = 0.01f
+                    it.layoutParams = FrameLayout.LayoutParams(390, 844)
+                }
+            }
         }
 
         /** Same request a visitor's page makes: through the page's own jQuery (same fingerprint), fetch as fallback. */

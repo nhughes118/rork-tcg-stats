@@ -154,6 +154,19 @@ nonisolated enum Leaderboard {
             return await fetcher.selectZone(zone)
         }
 
+        func captured() async -> (String, String)? {
+            guard let fetcher else { return nil }
+            return await fetcher.captured()
+        }
+
+        func showInteractive() async {
+            await fetcher?.showInteractive()
+        }
+
+        func hideInteractive() async {
+            await fetcher?.hideInteractive()
+        }
+
         func close() async {
             if let fetcher { await fetcher.close() }
             fetcher = nil
@@ -262,6 +275,29 @@ nonisolated enum Leaderboard {
                 if first != nil { break }
             }
             round += 1
+        }
+
+        // Last resort: show the real page and let the user pass Pokémon's check by hand. The hook keeps
+        // recording; as soon as the page itself receives leaderboard data, we harvest it and continue.
+        if first == nil {
+            print("[Leaderboard] all automatic attempts blocked; showing the page for the user to verify")
+            await session.showInteractive()
+            let deadline = Date().addingTimeInterval(150)
+            while first == nil && !Task.isCancelled && Date() < deadline {
+                try? await Task.sleep(for: .milliseconds(1500))
+                guard let (u, b) = await session.captured() else { continue }
+                if let (t, p) = shaped(u, b) {
+                    if t.queryItems?.first(where: { $0.name == "zone" })?.value == region.rawValue {
+                        first = p
+                        chosen = (t, t.queryItems?.first(where: { $0.name == "per_page" })?.value.flatMap { Int($0) })
+                    } else if let sel = await session.selectZone(region.rawValue), let (t2, p2) = shaped(sel.0, sel.1) {
+                        first = p2
+                        chosen = (t2, t2.queryItems?.first(where: { $0.name == "per_page" })?.value.flatMap { Int($0) })
+                    }
+                }
+            }
+            await session.hideInteractive()
+            try Task.checkCancellation()
         }
         guard let first, let chosen else {
             let diag = "page \(setup.capturedURL == nil ? "sent no request" : "request seen"), season \(setup.whenLabel ?? "?")"
@@ -385,6 +421,8 @@ extension Division {
 @MainActor
 final class LeaderboardWebFetcher: NSObject, WKNavigationDelegate {
     private var webView: WKWebView?
+    /// False while hidden (never touches); true in the manual-verify fallback where the user drives the page.
+    private var interactive = false
 
     /// Installed before any page script runs: remembers every leaderboard API request and its response.
     private static let hook = """
@@ -422,7 +460,9 @@ final class LeaderboardWebFetcher: NSObject, WKNavigationDelegate {
     private static let discover = """
     const pick = () => {
       const reqs = (window.__lbReqs || []).filter(r => r.url.indexOf('isUserStats') < 0);
-      return reqs.length ? reqs[reqs.length - 1] : null;
+      let best = null;
+      for (const r of reqs) if (r.body !== null && (!best || r.body.length > best.body.length)) best = r;
+      return best || reqs[reqs.length - 1] || null;
     };
     for (let i = 0; i < 30; i++) {
       const r = pick();
@@ -443,6 +483,16 @@ final class LeaderboardWebFetcher: NSObject, WKNavigationDelegate {
       whenLabel: opt ? opt.text.trim() : null,
       options: w ? Array.from(w.options).map(o => [o.value, o.text.trim()]) : []
     });
+    """
+
+    /// The captured request with the largest response — used to poll while the user passes the check.
+    private static let captureJS = """
+    (function(){
+      const reqs = (window.__lbReqs || []).filter(r => r.url.indexOf('isUserStats') < 0);
+      let best = null;
+      for (const r of reqs) if (r.body && (!best || r.body.length > best.body.length)) best = r;
+      return {url: best ? best.url : null, body: best ? String(best.body).slice(0, 500000) : null};
+    })()
     """
 
     /// Flips the page's own zone dropdown so its script issues the request itself; reports that request and response.
@@ -546,6 +596,32 @@ final class LeaderboardWebFetcher: NSObject, WKNavigationDelegate {
         """
         let result = try? await web.callAsyncJavaScript(js, arguments: ["url": url.absoluteString], in: nil, contentWorld: .page)
         return (result as? String) ?? ""
+    }
+
+    /// The captured request with the largest response so far, as (url, body).
+    func captured() async -> (String, String)? {
+        guard let web = webView else { return nil }
+        guard let o = try? await web.callAsyncJavaScript(Self.captureJS, arguments: [:], in: nil, contentWorld: .page) as? [String: Any],
+              let u = o["url"] as? String, !u.isEmpty else { return nil }
+        return (u, (o["body"] as? String) ?? "")
+    }
+
+    /// Manual-verify fallback: shows the real page so the user can pass Pokémon's check by hand.
+    func showInteractive() {
+        guard let web = webView else { return }
+        interactive = true
+        web.alpha = 1
+        web.isUserInteractionEnabled = true
+        if let window = web.window { web.frame = window.bounds }
+        web.superview?.bringSubviewToFront(web)
+    }
+
+    func hideInteractive() {
+        guard let web = webView else { return }
+        interactive = false
+        web.alpha = 0.01
+        web.isUserInteractionEnabled = false
+        web.frame = CGRect(x: 0, y: 0, width: 390, height: 844)
     }
 
     func close() {

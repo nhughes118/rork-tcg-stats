@@ -29,6 +29,8 @@ nonisolated enum Leaderboard {
         var when: String?
         var whenLabel: String?
         var whenOptions: [String: String] = [:]
+        /// How many leaderboard API requests the page's own script issued.
+        var seen: Int?
     }
 
     /// Request URLs to try, best first: the page's own request, then ones rebuilt from its dropdown values.
@@ -265,7 +267,7 @@ nonisolated enum Leaderboard {
             let diag = "page \(setup.capturedURL == nil ? "sent no request" : "request seen"), season \(setup.whenLabel ?? "?")"
             throw LeaderboardError(message: responded
                 ? "The \(division.label) \(region == .global ? "" : "\(region.label) ")leaderboard came back empty (\(diag))."
-                : "Pokémon's leaderboard didn't respond. It may be limiting requests, so try again in a minute.")
+                : "Pokémon's leaderboard didn't respond (page \(setup.ready ? "loaded" : "stuck"), \(setup.seen ?? 0) request(s) seen, \(setup.capturedBody.map { "\($0.count) chars" } ?? "no response")). It may be limiting requests, so try again in a minute.")
         }
         let (template, size) = chosen
         let seasonID = template.queryItems?.first(where: { $0.name == "leaderboard_when" })?.value
@@ -434,6 +436,7 @@ final class LeaderboardWebFetcher: NSObject, WKNavigationDelegate {
     return JSON.stringify({
       url: r ? r.url : null,
       body: r && r.body ? r.body.slice(0, 500000) : null,
+      seen: (window.__lbReqs || []).length,
       type: val('leaderboardTypeFilter'),
       zone: val('leaderboardZoneFilter'),
       when: w ? w.value : null,
@@ -482,6 +485,8 @@ final class LeaderboardWebFetcher: NSObject, WKNavigationDelegate {
             let created = WKWebView(frame: CGRect(x: 0, y: 0, width: 390, height: 844), configuration: config)
             created.alpha = 0.01
             created.isUserInteractionEnabled = false
+            // Present as Safari, not as a web view the firewall can single out.
+            created.customUserAgent = Leaderboard.userAgent
             created.navigationDelegate = self
             webView = created
             UIApplication.shared.connectedScenes
@@ -517,6 +522,7 @@ final class LeaderboardWebFetcher: NSObject, WKNavigationDelegate {
             setup.zone = s("zone")
             setup.when = s("when")
             setup.whenLabel = s("whenLabel")
+            setup.seen = o["seen"] as? Int
             for pair in (o["options"] as? [[String]]) ?? [] where pair.count == 2 {
                 if setup.whenOptions[pair[0]] == nil { setup.whenOptions[pair[0]] = pair[1] }
             }

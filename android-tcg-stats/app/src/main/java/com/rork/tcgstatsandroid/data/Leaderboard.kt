@@ -10,6 +10,7 @@ import android.util.Log
 import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
+import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.FrameLayout
@@ -120,6 +121,8 @@ object Leaderboard {
         val whenId: String? = null,
         val whenLabel: String? = null,
         val whenOptions: Map<String, String> = emptyMap(),
+        /** How many leaderboard API requests the page's own script issued. */
+        val seen: Int? = null,
     )
 
     /** An API URL with its query split out so paging can be swapped. */
@@ -306,7 +309,7 @@ object Leaderboard {
             if (first == null || chosen == null) {
                 throw LeaderboardException(
                     if (responded) "The ${division.label} ${if (region == LeaderboardRegion.Global) "" else "${region.label} "}leaderboard came back empty (page ${if (setup.capturedUrl == null) "sent no request" else "request seen"}, season ${setup.whenLabel ?: "?"})."
-                    else "Pokémon's leaderboard didn't respond. It may be limiting requests, so try again in a minute."
+                    else "Pokémon's leaderboard didn't respond (page ${if (setup.ready) "loaded" else "stuck"}, ${setup.seen ?: 0} request(s) seen, ${setup.capturedBody?.let { "${it.length} chars" } ?: "no response"}). It may be limiting requests, so try again in a minute."
                 )
             }
             val (template, size) = chosen
@@ -455,6 +458,7 @@ object Leaderboard {
       return JSON.stringify({
         url: r ? r.url : null,
         body: r && r.body ? r.body.slice(0, 500000) : null,
+        seen: (window.__lbReqs || []).length,
         type: val('leaderboardTypeFilter'),
         zone: val('leaderboardZoneFilter'),
         when: w ? w.value : null,
@@ -516,6 +520,8 @@ object Leaderboard {
                     view.settings.javaScriptEnabled = true
                     view.settings.domStorageEnabled = true
                     view.settings.loadsImagesAutomatically = false
+                    // Imperva blocks the stock WebView user agent ("; wv)") — present as regular Chrome.
+                    view.settings.userAgentString = WebSettings.getDefaultUserAgent(activity).replace("; wv)", ")")
                     CookieManager.getInstance().setAcceptCookie(true)
                     CookieManager.getInstance().setAcceptThirdPartyCookies(view, true)
                     view.addJavascriptInterface(object {
@@ -571,6 +577,7 @@ object Leaderboard {
                     whenId = s("when"),
                     whenLabel = s("whenLabel"),
                     whenOptions = options,
+                    seen = (o["seen"] as? JsonPrimitive)?.intOrNull,
                 )
             }
             return PageSetup(ready = true)

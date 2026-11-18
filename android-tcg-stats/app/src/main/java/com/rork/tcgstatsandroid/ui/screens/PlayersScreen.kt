@@ -614,7 +614,7 @@ private fun SyncLine(sync: LeaderboardSync, indexed: Int, onRefresh: () -> Unit)
         is LeaderboardSync.Ready -> Row(verticalAlignment = Alignment.CenterVertically) {
             val ago = DateUtils.getRelativeTimeSpanString(sync.fetchedAt, System.currentTimeMillis(), DateUtils.MINUTE_IN_MILLIS)
             Text(
-                "${indexed.fmt()} players · " + (sync.season?.let { "$it season · " } ?: "") + "updated $ago" + if (!sync.complete) " · partial" else "",
+                "${indexed.fmt()} players · " + (sync.season?.let { if (it.length == 4) "$it season · " else "$it · " } ?: "") + "updated $ago" + if (!sync.complete) " · partial" else "",
                 fontSize = 12.sp,
                 fontWeight = FontWeight.SemiBold,
                 color = Palette.Muted,

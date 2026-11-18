@@ -355,7 +355,7 @@ struct PlayersView: View {
             }
         case .ready(let date, let complete):
             HStack {
-                Text("\(model.players.count.grouped) players · \(model.season.map { "\($0) season · " } ?? "")updated \(date.formatted(.relative(presentation: .named)))\(complete ? "" : " · partial")")
+                Text("\(model.players.count.grouped) players · \(model.season.map { $0.count == 4 ? "\($0) season · " : "\($0) · " } ?? "")updated \(date.formatted(.relative(presentation: .named)))\(complete ? "" : " · partial")")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(Theme.muted)
                 Spacer(minLength: 8)

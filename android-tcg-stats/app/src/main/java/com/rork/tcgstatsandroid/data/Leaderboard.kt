@@ -93,8 +93,8 @@ object Leaderboard {
     private const val UA =
         "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
 
-    /** Season fallback if the championships site can't be read (the 2026 championship-points cycle). */
-    private val FALLBACK_PERIOD = LeaderboardPeriod("a0a3bb4a4c7a75628526ebbc7eb61d26", "2026")
+    /** Season fallback if the championships site can't be read (2027 Worlds qualification). */
+    private val FALLBACK_PERIOD = LeaderboardPeriod("1c13d02f09f3f0713f7e41986bef2f36", "2027 World Championships")
 
     /** A championship-points season/cycle as listed in the championships site's filters. */
     data class LeaderboardPeriod(val guid: String, val label: String)
@@ -109,7 +109,7 @@ object Leaderboard {
     }
 
     private fun periodsFile(context: Context): File =
-        File(File(context.filesDir, "leaderboard").apply { mkdirs() }, "periods-v1.json")
+        File(File(context.filesDir, "leaderboard").apply { mkdirs() }, "periods-v2.json")
 
     suspend fun cached(context: Context, division: Division, region: LeaderboardRegion): LeaderboardIndex? = withContext(Dispatchers.IO) {
         val file = cacheFile(context, division, region)
@@ -133,8 +133,8 @@ object Leaderboard {
     // ---------- Season filters ----------
 
     /**
-     * The season currently in cycle on the championships site (its "year" dropdown, which mixes whole
-     * seasons and single events). The store's `cycle_default` entry is the standing overall season.
+     * The championships site's own default season (its "year" dropdown, which mixes whole seasons
+     * and single events): the first entry in the store's list — currently 2027 Worlds qualification.
      */
     private suspend fun currentPeriod(context: Context): LeaderboardPeriod = withContext(Dispatchers.IO) {
         val file = periodsFile(context)
@@ -163,12 +163,7 @@ object Leaderboard {
                 LeaderboardPeriod(guid, name)
             }
             if (periods.isEmpty()) return@runCatching null
-            // Put the site's current cycle first, keeping the rest in the site's order.
-            val defaultGuid = results.firstNotNullOfOrNull { p ->
-                val po = p as? JsonObject
-                if (po?.str("cycle_default") == "true") po.str("guid") else null
-            }
-            periods.filter { it.guid == defaultGuid } + periods.filter { it.guid != defaultGuid }
+            periods
         }.getOrNull()
         if (fetched != null && fetched.isNotEmpty()) {
             runCatching {

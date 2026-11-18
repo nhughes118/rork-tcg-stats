@@ -26,8 +26,8 @@ nonisolated enum Leaderboard {
     private static let concurrency = 8
     static let userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1"
 
-    /// Season fallback if the championships site can't be read (the 2026 championship-points cycle).
-    private static let fallbackPeriod = LeaderboardPeriod(guid: "a0a3bb4a4c7a75628526ebbc7eb61d26", label: "2026")
+    /// Season fallback if the championships site can't be read (2027 Worlds qualification).
+    private static let fallbackPeriod = LeaderboardPeriod(guid: "1c13d02f09f3f0713f7e41986bef2f36", label: "2027 World Championships")
 
     /// A championship-points season/cycle as listed in the championships site's filters.
     nonisolated struct LeaderboardPeriod: Sendable, Hashable {
@@ -95,10 +95,10 @@ nonisolated enum Leaderboard {
         let periods: [PeriodDTO]
     }
 
-    /// The season currently in cycle on the championships site (its "year" dropdown, which mixes whole
-    /// seasons and single events). The store's `cycle_default` entry is the standing overall season.
+    /// The championships site's own default season (its "year" dropdown, which mixes whole seasons
+    /// and single events): the first entry in the store's list — currently 2027 Worlds qualification.
     private static func currentPeriod() async -> LeaderboardPeriod {
-        let file = cacheDir.appendingPathComponent("periods-v1.json")
+        let file = cacheDir.appendingPathComponent("periods-v2.json")
         if let data = try? Data(contentsOf: file),
            let cache = try? JSONDecoder().decode(PeriodsCache.self, from: data),
            Date().timeIntervalSince(cache.fetchedAt) < periodsTTL,
@@ -118,13 +118,10 @@ nonisolated enum Leaderboard {
             return LeaderboardPeriod(guid: guid, label: name)
         }
         guard !periods.isEmpty else { return fallbackPeriod }
-        // Put the site's current cycle first, keeping the rest in the site's order.
-        let defaultGuid = results.first(where: { str($0["cycle_default"]) == "true" }).flatMap { str($0["guid"]) }
-        let ordered = periods.filter { $0.guid == defaultGuid } + periods.filter { $0.guid != defaultGuid }
-        if let encoded = try? JSONEncoder().encode(PeriodsCache(fetchedAt: Date(), periods: ordered.map { PeriodDTO(guid: $0.guid, name: $0.label) })) {
+        if let encoded = try? JSONEncoder().encode(PeriodsCache(fetchedAt: Date(), periods: periods.map { PeriodDTO(guid: $0.guid, name: $0.label) })) {
             try? encoded.write(to: file, options: .atomic)
         }
-        return ordered[0]
+        return periods[0]
     }
 
     /// Depth-first search for a string field somewhere in the content-store payload.

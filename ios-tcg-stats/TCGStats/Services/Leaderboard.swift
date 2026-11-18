@@ -1,90 +1,67 @@
 import Foundation
 import UIKit
-import WebKit
 
 nonisolated struct LeaderboardError: LocalizedError, Sendable {
     let message: String
     var errorDescription: String? { message }
 }
 
-/// Downloads the Play! Pokémon TCG Championship Points leaderboard. The site has no name search, so the whole
+extension Division {
+    /// The division's leaderboard on Pokémon's championships site.
+    nonisolated var pageURL: URL {
+        URL(string: "https://championships.pokemon.com/en-us/competitors/leaderboards/?pillar=tcg&division=\(rawValue)")!
+    }
+}
+
+/// Downloads the Play! Pokémon TCG Championship Points leaderboard from the championships site's API
+/// (api.play.pokemon.com), which is open — no bot check. The site has no name search, so the whole
 /// division is indexed once (cached on disk for 12 hours) and searched locally.
 nonisolated enum Leaderboard {
-    private static let api = "https://www.pokemon.com/us/play-pokemon/leaderboards/op/api/"
+    /// The championships site's content store: source of the live region, division and season filters.
+    private static let store = URL(string: "https://championships.pokemon.com/api/1/site/content_store/item.json?url=/site/website/en-us/competitors/leaderboards/index.xml&flatten=true")!
+    private static let api = "https://api.play.pokemon.com/services/spar/leaderboards/"
     private static let cacheTTL: TimeInterval = 12 * 3600
-    private static let requestedPerPage = 100
+    private static let periodsTTL: TimeInterval = 24 * 3600
+    private static let perPage = 200
     private static let concurrency = 8
     static let userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1"
 
-    /// Known season ids (from the site's picker), used when the page can't be read.
-    private static let fallbackSeasons = [LeaderboardSeason(id: "60", label: "2026")]
+    /// Season fallback if the championships site can't be read (the 2026 championship-points cycle).
+    private static let fallbackPeriod = LeaderboardPeriod(guid: "a0a3bb4a4c7a75628526ebbc7eb61d26", label: "2026")
 
-    /// What the live page selected by default, plus the API request its own script made with those values.
-    struct PageSetup: Sendable {
-        var ready = false
-        var capturedURL: String?
-        var capturedBody: String?
-        var type: String?
-        var zone: String?
-        var when: String?
-        var whenLabel: String?
-        var whenOptions: [String: String] = [:]
-        /// How many leaderboard API requests the page's own script issued.
-        var seen: Int?
+    /// A championship-points season/cycle as listed in the championships site's filters.
+    nonisolated struct LeaderboardPeriod: Sendable, Hashable {
+        let guid: String
+        let label: String
     }
 
-    /// Request URLs to try, best first: the page's own request, then ones rebuilt from its dropdown values.
-    static func templates(_ division: Division, _ region: LeaderboardRegion, _ setup: PageSetup) -> [URLComponents] {
-        var out: [URLComponents] = []
-        if let u = setup.capturedURL, var c = URLComponents(string: u) {
-            var items = (c.queryItems ?? []).filter { $0.name != "zone" }
-            let at = items.firstIndex { $0.name == "include" || $0.name == "format" } ?? items.endIndex
-            items.insert(.init(name: "zone", value: region.rawValue), at: at)
-            c.queryItems = items
-            out.append(c)
-        }
-        let type = setup.type ?? "championship"
-        let when = setup.when ?? fallbackSeasons[0].id
-        func build(product: Bool, when: String?) -> URLComponents {
-            var c = URLComponents(string: "\(api)\(division.rawValue)/")!
-            var items: [URLQueryItem] = [.init(name: "leaderboard_type", value: type)]
-            if let when { items.append(.init(name: "leaderboard_when", value: when)) }
-            items.append(.init(name: "leaderboard_who", value: ""))
-            if product {
-                items.append(.init(name: "product", value: "tcg"))
-                items.append(.init(name: "league", value: division.league))
-            }
-            items.append(.init(name: "zone", value: region.rawValue))
-            items.append(.init(name: "include", value: "metadata"))
-            items.append(.init(name: "format", value: "json"))
-            c.queryItems = items
-            return c
-        }
-        out.append(build(product: true, when: when))
-        out.append(build(product: false, when: when))
-        out.append(build(product: true, when: nil))
-        var seen = Set<String>()
-        return out.filter { seen.insert($0.string ?? "").inserted }
+    private struct Board: Sendable {
+        let players: [LeaderboardPlayer]
+        let total: Int
     }
 
-    /// `template` with its paging replaced. A nil `perPage` keeps the template's own page size.
-    static func url(_ template: URLComponents, page: Int, perPage: Int?) -> URL? {
-        var c = template
-        var items = (c.queryItems ?? []).filter { $0.name != "page" && ($0.name != "per_page" || perPage == nil) }
-        if let perPage { items.append(.init(name: "per_page", value: String(perPage))) }
-        items.append(.init(name: "page", value: String(page)))
-        if !items.contains(where: { $0.name == "format" }) { items.append(.init(name: "format", value: "json")) }
-        c.queryItems = items
-        return c.url
+    private actor Collector {
+        private var byID: [String: LeaderboardPlayer] = [:]
+        private(set) var failedPages = 0
+        func add(_ records: [LeaderboardPlayer]) -> [LeaderboardPlayer] {
+            for r in records { byID[r.id] = r }
+            return Array(byID.values)
+        }
+        func fail() { failedPages += 1 }
+        func all() -> [LeaderboardPlayer] { Array(byID.values) }
     }
 
     // MARK: Cache
 
-    private static func cacheURL(_ division: Division, _ region: LeaderboardRegion) -> URL {
+    private static var cacheDir: URL {
         let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("leaderboard", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    private static func cacheURL(_ division: Division, _ region: LeaderboardRegion) -> URL {
         let suffix = region == .global ? "" : "-\(region.rawValue.lowercased())"
-        return dir.appendingPathComponent("\(division.rawValue)\(suffix)-v3.json")
+        return cacheDir.appendingPathComponent("\(division.rawValue)\(suffix)-v4.json")
     }
 
     static func cached(_ division: Division, _ region: LeaderboardRegion) async -> LeaderboardIndex? {
@@ -106,89 +83,136 @@ nonisolated enum Leaderboard {
         try? data.write(to: cacheURL(division, region), options: .atomic)
     }
 
+    // MARK: Season
+
+    private struct PeriodDTO: Codable {
+        let guid: String
+        let name: String
+    }
+
+    private struct PeriodsCache: Codable {
+        let fetchedAt: Date
+        let periods: [PeriodDTO]
+    }
+
+    /// The season currently in cycle on the championships site (its "year" dropdown, which mixes whole
+    /// seasons and single events). The store's `cycle_default` entry is the standing overall season.
+    private static func currentPeriod() async -> LeaderboardPeriod {
+        let file = cacheDir.appendingPathComponent("periods-v1.json")
+        if let data = try? Data(contentsOf: file),
+           let cache = try? JSONDecoder().decode(PeriodsCache.self, from: data),
+           Date().timeIntervalSince(cache.fetchedAt) < periodsTTL,
+           let first = cache.periods.first {
+            return LeaderboardPeriod(guid: first.guid, label: first.name)
+        }
+        guard let (data, response) = try? await URLSession.shared.data(from: store),
+              let http = response as? HTTPURLResponse, http.statusCode == 200,
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let raw = findString("periodsjson_t", in: root),
+              let periodsRoot = (try? JSONSerialization.jsonObject(with: Data(raw.utf8))) as? [String: Any],
+              let results = periodsRoot["results"] as? [[String: Any]] else {
+            return fallbackPeriod
+        }
+        let periods = results.compactMap { o -> LeaderboardPeriod? in
+            guard let guid = str(o["guid"]), let name = str(o["name"]) else { return nil }
+            return LeaderboardPeriod(guid: guid, label: name)
+        }
+        guard !periods.isEmpty else { return fallbackPeriod }
+        // Put the site's current cycle first, keeping the rest in the site's order.
+        let defaultGuid = results.first(where: { str($0["cycle_default"]) == "true" }).flatMap { str($0["guid"]) }
+        let ordered = periods.filter { $0.guid == defaultGuid } + periods.filter { $0.guid != defaultGuid }
+        if let encoded = try? JSONEncoder().encode(PeriodsCache(fetchedAt: Date(), periods: ordered.map { PeriodDTO(guid: $0.guid, name: $0.label) })) {
+            try? encoded.write(to: file, options: .atomic)
+        }
+        return ordered[0]
+    }
+
+    /// Depth-first search for a string field somewhere in the content-store payload.
+    private static func findString(_ key: String, in value: Any) -> String? {
+        if let dict = value as? [String: Any] {
+            for (k, v) in dict {
+                if k == key, let s = v as? String { return s }
+                if let found = findString(key, in: v) { return found }
+            }
+        } else if let array = value as? [Any] {
+            for v in array {
+                if let found = findString(key, in: v) { return found }
+            }
+        }
+        return nil
+    }
+
     // MARK: Fetching
 
-    private struct Page: Sendable {
-        let records: [LeaderboardPlayer]
-        let total: Int?
-        let pageCount: Int?
-    }
-
-    private struct Blocked: Error {}
-
-    private actor Collector {
-        private var byID: [String: LeaderboardPlayer] = [:]
-        private(set) var failedPages = 0
-        func add(_ records: [LeaderboardPlayer]) -> [LeaderboardPlayer] {
-            for r in records { byID[r.id] = r }
-            return Array(byID.values)
-        }
-        func fail() { failedPages += 1 }
-        func all() -> [LeaderboardPlayer] { Array(byID.values) }
-    }
-
-    /// Every request goes through a hidden web view on the division's real page, so it carries the same
-    /// bot-check cookies and dropdown defaults as a visitor's browser.
-    private actor FetchSession {
-        private var fetcher: LeaderboardWebFetcher?
-
-        func prepare(_ division: Division) async -> PageSetup {
-            let f = await LeaderboardWebFetcher()
-            fetcher = f
-            return await f.open(division.pageURL)
-        }
-
-        /// Reloads the page in the existing web view for a fresh bot-check session.
-        func reopen(_ division: Division) async -> PageSetup {
-            guard let fetcher else { return await prepare(division) }
-            return await fetcher.open(division.pageURL)
-        }
-
-        func text(_ url: URL) async -> String {
-            guard let fetcher else { return "" }
-            return await fetcher.get(url)
-        }
-
-        func selectZone(_ zone: String) async -> (String, String)? {
-            guard let fetcher else { return nil }
-            return await fetcher.selectZone(zone)
-        }
-
-        func captured() async -> (String, String)? {
-            guard let fetcher else { return nil }
-            return await fetcher.captured()
-        }
-
-        func showInteractive() async {
-            await fetcher?.showInteractive()
-        }
-
-        func hideInteractive() async {
-            await fetcher?.hideInteractive()
-        }
-
-        func close() async {
-            if let fetcher { await fetcher.close() }
-            fetcher = nil
-        }
-    }
-
-    private static func fetchPage(_ session: FetchSession, _ template: URLComponents, page: Int, perPage: Int?, attempts: Int = 3) async throws -> Page {
-        guard let url = url(template, page: page, perPage: perPage) else { throw Blocked() }
+    private static func fetchPage(_ division: Division, _ region: LeaderboardRegion, period: String, page: Int) async throws -> Board {
+        var c = URLComponents(string: api)!
+        c.queryItems = [
+            .init(name: "product", value: "tcg"),
+            .init(name: "region", value: region.rawValue),
+            .init(name: "region_type", value: region.type),
+            .init(name: "division", value: division.rawValue),
+            .init(name: "period", value: period),
+            .init(name: "page_size", value: String(perPage)),
+            .init(name: "page", value: String(page)),
+            .init(name: "point_type", value: "championship"),
+            .init(name: "sort_by", value: "ranking_order:asc"),
+        ]
+        guard let url = c.url else { throw LeaderboardError(message: "Pokémon's leaderboard didn't respond. Check your connection and try again.") }
         var attempt = 0
         while true {
-            try Task.checkCancellation()
-            let text = await session.text(url)
-            if text.drop(while: \.isWhitespace).first == "{", let parsed = parse(text, page: page) {
-                return parsed
+            do {
+                var request = URLRequest(url: url)
+                request.timeoutInterval = 30
+                request.setValue("application/json", forHTTPHeaderField: "Accept")
+                request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+                let (data, response) = try await URLSession.shared.data(for: request)
+                guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+                    throw LeaderboardError(message: "status \(attempt)")
+                }
+                guard let board = parse(data) else {
+                    throw LeaderboardError(message: "Pokémon's leaderboard didn't respond as expected.")
+                }
+                return board
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch let e as LeaderboardError where e.message.contains("expected") {
+                throw e
+            } catch {
+                attempt += 1
+                if attempt >= 3 {
+                    throw LeaderboardError(message: "Pokémon's leaderboard didn't respond. Check your connection and try again.")
+                }
+                try? await Task.sleep(for: .milliseconds(800 * attempt))
             }
-            attempt += 1
-            if attempt >= attempts {
-                print("[Leaderboard] page \(page) failed: \(url.absoluteString) -> \(text.prefix(160))")
-                throw Blocked()
-            }
-            try await Task.sleep(for: .milliseconds(1200 * attempt))
         }
+    }
+
+    private static func parse(_ data: Data) -> Board? {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let results = root["results"] as? [[String: Any]] else { return nil }
+        let players: [LeaderboardPlayer] = results.enumerated().compactMap { i, o in
+            guard let name = str(o["display_name"]) else { return nil }
+            return LeaderboardPlayer(
+                rank: int(o["rank"]) ?? i + 1,
+                name: name,
+                points: int(o["primary_point_total"]) ?? 0,
+                country: str(o["player_country"]),
+                countryCode: str(o["player_country_code"]),
+                inCutoff: false
+            )
+        }
+        return Board(players: players, total: int(root["count"]) ?? players.count)
+    }
+
+    private static func str(_ v: Any?) -> String? {
+        guard let s = (v as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty, s != "null" else { return nil }
+        return s
+    }
+
+    private static func int(_ v: Any?) -> Int? {
+        if let n = v as? NSNumber { return n.intValue }
+        if let s = v as? String { return Int(s) ?? Double(s).map { Int($0) } }
+        return nil
     }
 
     /// Indexes `division`. `onProgress` receives the players collected so far (unsorted) and the expected total.
@@ -197,130 +221,23 @@ nonisolated enum Leaderboard {
         region: LeaderboardRegion,
         onProgress: @escaping @Sendable ([LeaderboardPlayer], Int) async -> Void
     ) async throws -> LeaderboardIndex {
-        let session = FetchSession()
-        do {
-            let index = try await run(session, division, region, onProgress: onProgress)
-            await session.close()
-            return index
-        } catch {
-            await session.close()
-            throw error
+        let period = await currentPeriod()
+        let first = try await fetchPage(division, region, period: period.guid, page: 1)
+        guard !first.players.isEmpty else {
+            throw LeaderboardError(message: "The \(division.label) \(region == .global ? "" : "\(region.label) ")leaderboard came back empty.")
         }
-    }
-
-    private static func run(
-        _ session: FetchSession,
-        _ division: Division,
-        _ region: LeaderboardRegion,
-        onProgress: @escaping @Sendable ([LeaderboardPlayer], Int) async -> Void
-    ) async throws -> LeaderboardIndex {
-        var setup = await session.prepare(division)
-        print("[Leaderboard] \(division.rawValue) page ready=\(setup.ready) type=\(setup.type ?? "-") when=\(setup.when ?? "-") (\(setup.whenLabel ?? "-")) zone=\(setup.zone ?? "-")")
-        print("[Leaderboard] captured: \(setup.capturedURL ?? "none") body=\(setup.capturedBody?.prefix(200) ?? "none")")
-        guard setup.ready else {
-            throw LeaderboardError(message: "Pokémon's leaderboard page didn't load. It may be limiting requests, so try again in a minute.")
-        }
-
-        var first: Page?
-        var chosen: (URLComponents, Int?)?
-        var responded = false
-
-        // Best path: use the page's own request and response — the exact traffic a visitor's browser
-        // generates, which the bot check already lets through. Only fall back to replaying requests
-        // ourselves when the page's own response isn't usable for the requested region.
-        func shaped(_ url: String?, _ body: String?) -> (URLComponents, Page)? {
-            guard let url, let body, body.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("{"),
-                  let template = URLComponents(string: url),
-                  let page = parse(body, page: 1), !page.records.isEmpty else { return nil }
-            return (template, page)
-        }
-        if let (t, p) = shaped(setup.capturedURL, setup.capturedBody),
-           t.queryItems?.first(where: { $0.name == "zone" })?.value == region.rawValue {
-            first = p
-            chosen = (t, t.queryItems?.first(where: { $0.name == "per_page" })?.value.flatMap { Int($0) })
-        }
-        if first == nil {
-            let sel = await session.selectZone(region.rawValue)
-            print("[Leaderboard] driven: \(sel?.0 ?? "none") body=\(sel?.1.prefix(120) ?? "none")")
-            if let (t, p) = shaped(sel?.0, sel?.1) {
-                first = p
-                chosen = (t, t.queryItems?.first(where: { $0.name == "per_page" })?.value.flatMap { Int($0) })
-            }
-        }
-
-        // The page's own request can come back as a block stub while the bot check settles. Two passes:
-        // after the first pass finds nothing, reload the page once for a fresh session and try again.
-        var round = 0
-        while first == nil && round < 2 {
-            if round == 1 {
-                print("[Leaderboard] no data yet; reloading the page for a fresh session")
-                setup = await session.reopen(division)
-                guard setup.ready else { break }
-            }
-            for template in templates(division, region, setup) {
-                // The site's own picker tops out at 100 rows; larger sizes come back empty, so never trust those.
-                let sizes: [Int?] = [requestedPerPage, nil]
-                for size in sizes {
-                    do {
-                        let page = try await fetchPage(session, template, page: 1, perPage: size, attempts: 2)
-                        responded = true
-                        print("[Leaderboard] probe \(template.string ?? "") per_page=\(size.map(String.init) ?? "page") -> \(page.records.count) records, total \(page.total ?? -1)")
-                        if !page.records.isEmpty { first = page; chosen = (template, size); break }
-                    } catch is CancellationError {
-                        throw CancellationError()
-                    } catch {
-                        continue
-                    }
-                }
-                if first != nil { break }
-            }
-            round += 1
-        }
-
-        // Last resort: show the real page and let the user pass Pokémon's check by hand. The hook keeps
-        // recording; as soon as the page itself receives leaderboard data, we harvest it and continue.
-        if first == nil {
-            print("[Leaderboard] all automatic attempts blocked; showing the page for the user to verify")
-            await session.showInteractive()
-            let deadline = Date().addingTimeInterval(150)
-            while first == nil && !Task.isCancelled && Date() < deadline {
-                try? await Task.sleep(for: .milliseconds(1500))
-                guard let (u, b) = await session.captured() else { continue }
-                if let (t, p) = shaped(u, b) {
-                    if t.queryItems?.first(where: { $0.name == "zone" })?.value == region.rawValue {
-                        first = p
-                        chosen = (t, t.queryItems?.first(where: { $0.name == "per_page" })?.value.flatMap { Int($0) })
-                    } else if let sel = await session.selectZone(region.rawValue), let (t2, p2) = shaped(sel.0, sel.1) {
-                        first = p2
-                        chosen = (t2, t2.queryItems?.first(where: { $0.name == "per_page" })?.value.flatMap { Int($0) })
-                    }
-                }
-            }
-            await session.hideInteractive()
-            try Task.checkCancellation()
-        }
-        guard let first, let chosen else {
-            let diag = "page \(setup.capturedURL == nil ? "sent no request" : "request seen"), season \(setup.whenLabel ?? "?")"
-            throw LeaderboardError(message: responded
-                ? "The \(division.label) \(region == .global ? "" : "\(region.label) ")leaderboard came back empty (\(diag))."
-                : "Pokémon's leaderboard didn't respond (page \(setup.ready ? "loaded" : "stuck"), \(setup.seen ?? 0) request(s) seen, \(setup.capturedBody.map { "\($0.count) chars" } ?? "no response")). It may be limiting requests, so try again in a minute.")
-        }
-        let (template, size) = chosen
-        let seasonID = template.queryItems?.first(where: { $0.name == "leaderboard_when" })?.value
-        let seasonLabel = seasonID.flatMap { setup.whenOptions[$0] } ?? setup.whenLabel
-        let perPage = first.records.count
-        let total = first.total ?? perPage
-        let pageCount = (first.pageCount ?? 0) > 0 ? first.pageCount! : Int((Double(total) / Double(perPage)).rounded(.up))
-        print("[Leaderboard] \(division.rawValue): total=\(total) perPage=\(perPage) pages=\(pageCount) season=\(seasonLabel ?? "-")")
+        let total = first.total
+        let pageCount = max(1, Int((Double(total) / Double(perPage)).rounded(.up)))
+        print("[Leaderboard] \(division.rawValue): total=\(total) pages=\(pageCount) season=\(period.label)")
 
         let collector = Collector()
-        await onProgress(await collector.add(first.records), total)
+        await onProgress(await collector.add(first.players), total)
 
         if pageCount > 1 {
             try await withThrowingTaskGroup(of: [LeaderboardPlayer]?.self) { group in
                 var pages = Array(2...pageCount).makeIterator()
                 let task: @Sendable (Int) async throws -> [LeaderboardPlayer]? = { page in
-                    do { return try await fetchPage(session, template, page: page, perPage: size).records }
+                    do { return try await fetchPage(division, region, period: period.guid, page: page).players }
                     catch is CancellationError { throw CancellationError() }
                     catch { return nil }
                 }
@@ -340,47 +257,10 @@ nonisolated enum Leaderboard {
 
         let players = await collector.all().sorted { $0.rank < $1.rank }
         let failed = await collector.failedPages
-        let index = LeaderboardIndex(division: division.rawValue, fetchedAt: Date(), total: total, complete: failed == 0, players: players, season: seasonLabel, region: region.rawValue)
+        let index = LeaderboardIndex(division: division.rawValue, fetchedAt: Date(), total: total, complete: failed == 0, players: players, season: period.label, region: region.rawValue)
         print("[Leaderboard] \(division.rawValue): indexed \(players.count)/\(total) (failed pages \(failed))")
         save(index, division, region)
         return index
-    }
-
-    private static func parse(_ text: String, page: Int) -> Page? {
-        guard let data = text.data(using: .utf8),
-              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
-        // A bare {} (no leaderboard/records/_metadata) is the bot check's block stub, not an empty
-        // leaderboard — returning nil makes the caller treat it like any other blocked response.
-        guard root["leaderboard"] != nil || root["records"] != nil || root["_metadata"] != nil else { return nil }
-        let board = root["leaderboard"] as? [String: Any]
-        let meta = (root["_metadata"] as? [String: Any]) ?? (board?["_metadata"] as? [String: Any])
-        let boardMeta = board?["_metadata"] as? [String: Any]
-        let records = (board?["records"] as? [[String: Any]]) ?? (root["records"] as? [[String: Any]]) ?? []
-        let perPage = int(meta?["per_page"]) ?? int(boardMeta?["per_page"]) ?? records.count
-        let players: [LeaderboardPlayer] = records.enumerated().compactMap { i, o in
-            guard let name = (str(o["screen_name"]) ?? str(o["name"]))?.replacingOccurrences(of: "\\'", with: "'") else { return nil }
-            return LeaderboardPlayer(
-                rank: int(o["rank"]) ?? ((page - 1) * perPage + i + 1),
-                name: name,
-                points: int(o["score"]) ?? 0,
-                country: str(o["country_name"]),
-                countryCode: str(o["country"]),
-                inCutoff: (o["in_cutoff"] as? Bool) ?? ((o["in_cutoff"] as? NSNumber)?.boolValue ?? false)
-            )
-        }
-        func metaInt(_ k: String) -> Int? { int(meta?[k]) ?? int(boardMeta?[k]) }
-        return Page(records: players, total: metaInt("total_count"), pageCount: metaInt("page_count"))
-    }
-
-    private static func str(_ v: Any?) -> String? {
-        guard let s = (v as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty, s != "null" else { return nil }
-        return s
-    }
-
-    private static func int(_ v: Any?) -> Int? {
-        if let n = v as? NSNumber { return n.intValue }
-        if let s = v as? String { return Int(s) ?? Double(s).map { Int($0) } }
-        return nil
     }
 
     // MARK: Search
@@ -404,229 +284,5 @@ nonisolated enum Leaderboard {
         }
         out.sort { $0.rank < $1.rank }
         return Array(out.prefix(limit))
-    }
-}
-
-extension Division {
-    /// The division's public leaderboard page (Masters lives at `tcg-masters/`, the others at their API slug).
-    nonisolated var pageURL: URL {
-        let slug = self == .masters ? "tcg-masters" : rawValue
-        return URL(string: "https://www.pokemon.com/us/play-pokemon/leaderboards/\(slug)/")!
-    }
-    nonisolated var league: String { String(rawValue.dropFirst(4)) }
-}
-
-/// Loads the real leaderboard page, records the API request its own script makes with the default dropdowns,
-/// then issues same-origin fetches from inside the page.
-@MainActor
-final class LeaderboardWebFetcher: NSObject, WKNavigationDelegate {
-    private var webView: WKWebView?
-    /// False while hidden (never touches); true in the manual-verify fallback where the user drives the page.
-    private var interactive = false
-
-    /// Installed before any page script runs: remembers every leaderboard API request and its response.
-    private static let hook = """
-    (function(){
-      if (window.__lbHooked) return; window.__lbHooked = true; window.__lbReqs = [];
-      var open = XMLHttpRequest.prototype.open;
-      XMLHttpRequest.prototype.open = function(m, u) {
-        try {
-          var abs = new URL(u, location.href).href;
-          if (abs.indexOf('leaderboard_type') >= 0) {
-            var entry = {url: abs, body: null}; window.__lbReqs.push(entry);
-            var xhr = this;
-            this.addEventListener('loadend', function(){ try { entry.body = xhr.responseText || ''; } catch(e) { entry.body = ''; } });
-          }
-        } catch (e) {}
-        return open.apply(this, arguments);
-      };
-      if (window.fetch) {
-        var f = window.fetch;
-        window.fetch = function(input, init) {
-          var u = typeof input === 'string' ? input : (input && input.url) || '';
-          var p = f.apply(this, arguments);
-          try {
-            if (u.indexOf('leaderboard_type') >= 0 && !(init && init.__lbOwn)) {
-              var entry = {url: new URL(u, location.href).href, body: null}; window.__lbReqs.push(entry);
-              p.then(function(r){ return r.clone().text(); }).then(function(t){ entry.body = t; }, function(){ entry.body = ''; });
-            }
-          } catch (e) {}
-          return p;
-        };
-      }
-    })();
-    """
-
-    private static let discover = """
-    const pick = () => {
-      const reqs = (window.__lbReqs || []).filter(r => r.url.indexOf('isUserStats') < 0);
-      let best = null;
-      for (const r of reqs) if (r.body !== null && (!best || r.body.length > best.body.length)) best = r;
-      return best || reqs[reqs.length - 1] || null;
-    };
-    for (let i = 0; i < 30; i++) {
-      const r = pick();
-      if (r && r.body !== null) break;
-      await new Promise(res => setTimeout(res, 500));
-    }
-    const r = pick();
-    const val = id => { const s = document.getElementById(id); return s ? s.value : null; };
-    const w = document.getElementById('leaderboardWhenFilter');
-    const opt = w && w.selectedIndex >= 0 ? w.options[w.selectedIndex] : null;
-    return JSON.stringify({
-      url: r ? r.url : null,
-      body: r && r.body ? r.body.slice(0, 500000) : null,
-      seen: (window.__lbReqs || []).length,
-      type: val('leaderboardTypeFilter'),
-      zone: val('leaderboardZoneFilter'),
-      when: w ? w.value : null,
-      whenLabel: opt ? opt.text.trim() : null,
-      options: w ? Array.from(w.options).map(o => [o.value, o.text.trim()]) : []
-    });
-    """
-
-    /// The captured request with the largest response — used to poll while the user passes the check.
-    private static let captureJS = """
-    (function(){
-      const reqs = (window.__lbReqs || []).filter(r => r.url.indexOf('isUserStats') < 0);
-      let best = null;
-      for (const r of reqs) if (r.body && (!best || r.body.length > best.body.length)) best = r;
-      return {url: best ? best.url : null, body: best ? String(best.body).slice(0, 500000) : null};
-    })()
-    """
-
-    /// Flips the page's own zone dropdown so its script issues the request itself; reports that request and response.
-    func selectZone(_ zone: String) async -> (String, String)? {
-        guard let web = webView else { return nil }
-        let js = """
-        const s = document.getElementById('leaderboardZoneFilter');
-        if (!s) return {url: null, body: null};
-        const has = Array.from(s.options).some(function(o){ return o.value === zone; });
-        if (!has) return {url: null, body: null};
-        const before = (window.__lbReqs || []).length;
-        if (s.value !== zone) { s.value = zone; s.dispatchEvent(new Event('change', {bubbles: true})); }
-        for (let i = 0; i < 40; i++) {
-          const reqs = (window.__lbReqs || []);
-          for (let j = before; j < reqs.length; j++) {
-            const r = reqs[j];
-            if (r.url.indexOf('isUserStats') < 0 && r.body !== null) {
-              return {url: r.url, body: String(r.body).slice(0, 500000)};
-            }
-          }
-          await new Promise(function(res){ setTimeout(res, 500); });
-        }
-        return {url: null, body: null};
-        """
-        guard let o = try? await web.callAsyncJavaScript(js, arguments: ["zone": zone], in: nil, contentWorld: .page) as? [String: Any],
-              let u = o["url"] as? String, !u.isEmpty else { return nil }
-        let body = (o["body"] as? String) ?? ""
-        return (u, body)
-    }
-
-    func open(_ url: URL) async -> Leaderboard.PageSetup {
-        var setup = Leaderboard.PageSetup()
-        let web: WKWebView
-        if let existing = webView {
-            web = existing
-        } else {
-            let config = WKWebViewConfiguration()
-            config.websiteDataStore = .default()
-            config.userContentController.addUserScript(WKUserScript(source: Self.hook, injectionTime: .atDocumentStart, forMainFrameOnly: true))
-            let created = WKWebView(frame: CGRect(x: 0, y: 0, width: 390, height: 844), configuration: config)
-            created.alpha = 0.01
-            created.isUserInteractionEnabled = false
-            // Present as Safari, not as a web view the firewall can single out.
-            created.customUserAgent = Leaderboard.userAgent
-            created.navigationDelegate = self
-            webView = created
-            UIApplication.shared.connectedScenes
-                .compactMap { ($0 as? UIWindowScene)?.keyWindow }
-                .first?
-                .addSubview(created)
-            web = created
-        }
-        // A reload starts a fresh session; the hook script is re-injected with the new document.
-        web.load(URLRequest(url: url))
-
-        // The bot check serves an interstitial that reloads itself; the real page has the rankings container.
-        let deadline = Date().addingTimeInterval(30)
-        while Date() < deadline {
-            try? await Task.sleep(for: .milliseconds(600))
-            let ready = (try? await web.evaluateJavaScript("!!document.querySelector('#stats-leaderboards-selected-rankings') && !!window.jQuery")) as? Bool
-            if ready == true { setup.ready = true; break }
-        }
-        guard setup.ready else { return setup }
-
-        // Give the page's own script time to issue its first request, retrying if a late reload interrupts us.
-        for _ in 0..<3 {
-            guard let json = (try? await web.callAsyncJavaScript(Self.discover, arguments: [:], in: nil, contentWorld: .page)) as? String,
-                  let data = json.data(using: .utf8),
-                  let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                try? await Task.sleep(for: .seconds(1))
-                continue
-            }
-            func s(_ k: String) -> String? { (o[k] as? String).flatMap { $0.isEmpty ? nil : $0 } }
-            setup.capturedURL = s("url")
-            setup.capturedBody = s("body")
-            setup.type = s("type")
-            setup.zone = s("zone")
-            setup.when = s("when")
-            setup.whenLabel = s("whenLabel")
-            setup.seen = o["seen"] as? Int
-            for pair in (o["options"] as? [[String]]) ?? [] where pair.count == 2 {
-                if setup.whenOptions[pair[0]] == nil { setup.whenOptions[pair[0]] = pair[1] }
-            }
-            break
-        }
-        return setup
-    }
-
-    /// Same request a visitor's page makes: through the page's own jQuery (same fingerprint), fetch as fallback.
-    func get(_ url: URL) async -> String {
-        guard let web = webView else { return "" }
-        let js = """
-        return await new Promise(function(res){
-          if (window.jQuery) {
-            window.jQuery.ajax({url: url, dataType: 'text', success: function(d){ res(d); }, error: function(){ res(''); }});
-          } else {
-            fetch(url, {credentials: 'include', __lbOwn: true, headers: {'Accept': 'application/json, text/javascript, */*; q=0.01', 'X-Requested-With': 'XMLHttpRequest'}})
-              .then(function(r){ return r.text(); }).then(res, function(){ res(''); });
-          }
-        });
-        """
-        let result = try? await web.callAsyncJavaScript(js, arguments: ["url": url.absoluteString], in: nil, contentWorld: .page)
-        return (result as? String) ?? ""
-    }
-
-    /// The captured request with the largest response so far, as (url, body).
-    func captured() async -> (String, String)? {
-        guard let web = webView else { return nil }
-        guard let o = try? await web.callAsyncJavaScript(Self.captureJS, arguments: [:], in: nil, contentWorld: .page) as? [String: Any],
-              let u = o["url"] as? String, !u.isEmpty else { return nil }
-        return (u, (o["body"] as? String) ?? "")
-    }
-
-    /// Manual-verify fallback: shows the real page so the user can pass Pokémon's check by hand.
-    func showInteractive() {
-        guard let web = webView else { return }
-        interactive = true
-        web.alpha = 1
-        web.isUserInteractionEnabled = true
-        if let window = web.window { web.frame = window.bounds }
-        web.superview?.bringSubviewToFront(web)
-    }
-
-    func hideInteractive() {
-        guard let web = webView else { return }
-        interactive = false
-        web.alpha = 0.01
-        web.isUserInteractionEnabled = false
-        web.frame = CGRect(x: 0, y: 0, width: 390, height: 844)
-    }
-
-    func close() {
-        webView?.stopLoading()
-        webView?.removeFromSuperview()
-        webView = nil
     }
 }

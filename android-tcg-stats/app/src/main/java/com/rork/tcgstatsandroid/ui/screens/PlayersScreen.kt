@@ -205,7 +205,7 @@ class PlayersViewModel(app: Application) : AndroidViewModel(app) {
             val division = _state.value.division
             val region = _state.value.region
             val cached = cacheIndex ?: Leaderboard.cached(getApplication(), division, region)?.also { cacheIndex = it }
-            if (cached != null && cached.division == division.slug && cached.region == region.zone && Leaderboard.isFresh(cached)) {
+            if (cached != null && cached.division == division.slug && cached.region == region.code && Leaderboard.isFresh(cached)) {
                 if (_state.value.players.isEmpty()) {
                     applyPlayers(cached.players, cached.total)
                     _state.update { it.copy(sync = LeaderboardSync.Ready(cached.fetchedAt, cached.complete, cached.season)) }

@@ -15,6 +15,7 @@ final class PlayersModel {
             recompute(debounce: true)
         }
     }
+    private(set) var game: Game = Game(rawValue: UserDefaults.standard.string(forKey: Keys.game) ?? "") ?? .tcg
     private(set) var division: Division = Division(rawValue: UserDefaults.standard.string(forKey: Keys.division) ?? "") ?? .masters
     private(set) var region: LeaderboardRegion = LeaderboardRegion(rawValue: UserDefaults.standard.string(forKey: Keys.region) ?? "") ?? .global
     private(set) var sync: Sync = .idle
@@ -32,17 +33,22 @@ final class PlayersModel {
 
     private enum Keys {
         static let query = "players_query"
+        static let game = "players_game"
         static let division = "players_division"
         static let region = "players_region"
         static let meName = "players_me_name"
+        static let meGame = "players_me_game"
         static let meDivision = "players_me_division"
         static let meRank = "players_me_rank"
     }
 
     var isLoading: Bool { if case .loading = sync { true } else { false } }
 
-    /// Identifies the board on screen; changes whenever division or region does.
-    var boardID: String { "\(division.rawValue)|\(region.rawValue)" }
+    /// Label for the age-division slot in the UI; Pokémon GO has none.
+    var categoryLabel: String { game.hasDivisions ? division.label : game.label }
+
+    /// Identifies the board on screen; changes whenever game, division or region does.
+    var boardID: String { "\(game.rawValue)|\(division.rawValue)|\(region.rawValue)" }
 
     private func apply(_ list: [LeaderboardPlayer], total: Int) async {
         let norms = await Task.detached(priority: .userInitiated) { list.map { Leaderboard.normalize($0.name) } }.value
@@ -51,6 +57,13 @@ final class PlayersModel {
         self.total = total
         resolveMe()
         recompute(debounce: false)
+    }
+
+    func setGame(_ g: Game) {
+        guard g != game else { return }
+        game = g
+        UserDefaults.standard.set(g.rawValue, forKey: Keys.game)
+        resetBoard()
     }
 
     func setDivision(_ d: Division) {
@@ -81,9 +94,10 @@ final class PlayersModel {
 
     /// Shows the cached index right away and refreshes it if it's stale.
     func ensureLoaded() async {
+        let g = game
         let d = division
         let r = region
-        if cacheIndex == nil, let cached = await Leaderboard.cached(d, r), d == division, r == region {
+        if cacheIndex == nil, let cached = await Leaderboard.cached(g, d, r), g == game, d == division, r == region {
             cacheIndex = cached
             season = cached.season
             await apply(cached.players, total: cached.total)
@@ -95,6 +109,7 @@ final class PlayersModel {
 
     func refresh() {
         loadTask?.cancel()
+        let g = game
         let d = division
         let r = region
         let board = boardID
@@ -103,7 +118,7 @@ final class PlayersModel {
         loadTask = Task { [weak self] in
             let throttle = Throttle()
             do {
-                let index = try await Leaderboard.load(d, region: r) { collected, total in
+                let index = try await Leaderboard.load(g, d, region: r) { collected, total in
                     let emit = await throttle.shouldEmit(done: collected.count >= total)
                     let sorted = (!hadPlayers && emit) ? collected.sorted { $0.rank < $1.rank } : nil
                     await MainActor.run {
@@ -154,10 +169,11 @@ final class PlayersModel {
     func toggleMe(_ p: LeaderboardPlayer) {
         let defaults = UserDefaults.standard
         if isMe(p) {
-            [Keys.meName, Keys.meDivision, Keys.meRank].forEach(defaults.removeObject(forKey:))
+            [Keys.meName, Keys.meGame, Keys.meDivision, Keys.meRank].forEach(defaults.removeObject(forKey:))
             withAnimation(.snappy) { me = nil }
         } else {
             defaults.set(p.name, forKey: Keys.meName)
+            defaults.set(game.rawValue, forKey: Keys.meGame)
             defaults.set(division.rawValue, forKey: Keys.meDivision)
             defaults.set(p.rank, forKey: Keys.meRank)
             withAnimation(.snappy) { me = p }
@@ -166,7 +182,9 @@ final class PlayersModel {
 
     private func resolveMe() {
         let defaults = UserDefaults.standard
-        guard let name = defaults.string(forKey: Keys.meName), defaults.string(forKey: Keys.meDivision) == division.rawValue else {
+        guard let name = defaults.string(forKey: Keys.meName),
+              defaults.string(forKey: Keys.meGame) == game.rawValue,
+              defaults.string(forKey: Keys.meDivision) == division.rawValue else {
             me = nil
             return
         }
@@ -251,6 +269,7 @@ struct PlayersView: View {
                     player: player,
                     players: model.players,
                     total: model.total,
+                    game: model.game,
                     division: model.division,
                     region: model.region,
                     isMe: model.isMe(player),
@@ -292,11 +311,19 @@ struct PlayersView: View {
             .frame(height: 46)
             .background(Color(.tertiarySystemFill), in: .rect(cornerRadius: 12))
 
-            Picker("Division", selection: Binding(get: { model.division }, set: { model.setDivision($0) })) {
-                ForEach(Division.allCases) { Text($0.label).tag($0) }
+            Picker("Game", selection: Binding(get: { model.game }, set: { model.setGame($0) })) {
+                ForEach(Game.allCases) { Text($0.label).tag($0) }
             }
             .pickerStyle(.segmented)
-            .sensoryFeedback(.selection, trigger: model.division)
+            .sensoryFeedback(.selection, trigger: model.game)
+
+            if model.game.hasDivisions {
+                Picker("Division", selection: Binding(get: { model.division }, set: { model.setDivision($0) })) {
+                    ForEach(Division.allCases) { Text($0.label).tag($0) }
+                }
+                .pickerStyle(.segmented)
+                .sensoryFeedback(.selection, trigger: model.division)
+            }
 
             regionChips
 
@@ -387,7 +414,7 @@ struct PlayersView: View {
             let count = model.results.count
             let plus = count >= 200 ? "+" : ""
             let header: String = !searching
-                ? "Top 10 · \(model.division.label) · \(model.region.label)"
+                ? "Top 10 · \(model.categoryLabel) · \(model.region.label)"
                 : count == 0 ? "" : model.isLoading ? "\(count)\(plus) matches so far" : "\(count)\(plus) match\(count == 1 ? "" : "es")"
             if !header.isEmpty {
                 Text(header)
@@ -403,7 +430,7 @@ struct PlayersView: View {
                     title: model.isLoading ? "Still searching…" : "No players found",
                     message: model.isLoading
                         ? "Nobody named “\(q)” yet. The rest of the leaderboard is still loading."
-                        : "Nobody named “\(q)” in \(model.division.label)\(model.region == .global ? "" : " (\(model.region.label))"). Only players with Championship Points this season are listed.",
+                        : "Nobody named “\(q)” in \(model.categoryLabel)\(model.region == .global ? "" : " (\(model.region.label))"). Only players with Championship Points this season are listed.",
                     retry: nil,
                     showLink: false
                 )
@@ -413,7 +440,7 @@ struct PlayersView: View {
                         .buttonStyle(PlayersPressStyle())
                 }
             }
-            Button { openURL(model.division.pageURL) } label: {
+            Button { openURL(model.game.pageURL(division: model.division)) } label: {
                 Label("Full leaderboard on Pokémon.com", systemImage: "arrow.up.right.square")
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(Theme.blue)
@@ -463,7 +490,7 @@ struct PlayersView: View {
                             .tint(Theme.blue)
                     }
                     if showLink {
-                        Button("Open on Pokémon.com") { openURL(model.division.pageURL) }
+                        Button("Open on Pokémon.com") { openURL(model.game.pageURL(division: model.division)) }
                             .buttonStyle(.bordered)
                             .tint(Theme.blue)
                     }
@@ -602,10 +629,13 @@ private struct PlayerDetailSheet: View {
     let player: LeaderboardPlayer
     let players: [LeaderboardPlayer]
     let total: Int
+    let game: Game
     let division: Division
     let region: LeaderboardRegion
     let isMe: Bool
     let onToggleMe: () -> Void
+
+    private var category: String { game.hasDivisions ? division.label : game.label }
     @Environment(\.openURL) private var openURL
     @State private var tracked = false
 
@@ -624,7 +654,7 @@ private struct PlayerDetailSheet: View {
                     RankBadge(rank: player.rank, size: 56)
                     VStack(alignment: .leading, spacing: 2) {
                         Text(player.name).font(.title2.bold()).foregroundStyle(Theme.ink)
-                        Text([player.country, division.label, region == .global ? nil : region.label].compactMap { $0 }.joined(separator: " · "))
+                        Text([player.country, category, region == .global ? nil : region.label].compactMap { $0 }.joined(separator: " · "))
                             .font(.subheadline).foregroundStyle(Theme.muted)
                     }
                 }
@@ -687,7 +717,7 @@ private struct PlayerDetailSheet: View {
                 .tint(isMe ? Theme.ink : Theme.red)
                 .sensoryFeedback(.success, trigger: tracked)
 
-                Button { openURL(division.pageURL) } label: {
+                Button { openURL(game.pageURL(division: division)) } label: {
                     Label("Leaderboard on Pokémon.com", systemImage: "arrow.up.right.square")
                         .font(.headline)
                         .frame(maxWidth: .infinity)

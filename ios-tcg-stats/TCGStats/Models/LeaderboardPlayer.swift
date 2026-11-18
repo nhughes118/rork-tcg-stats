@@ -16,6 +16,47 @@ nonisolated enum Division: String, CaseIterable, Codable, Sendable, Identifiable
     }
 }
 
+/// Championship product: the Trading Card Game, the video games (VGC) or Pokémon GO.
+nonisolated enum Game: String, CaseIterable, Codable, Sendable, Identifiable {
+    case tcg
+    case vgc
+    case go
+
+    var id: String { rawValue }
+
+    /// The product code the leaderboards API expects.
+    var apiSlug: String {
+        switch self {
+        case .tcg: "tcg"
+        case .vgc: "vg"
+        case .go: "pgo"
+        }
+    }
+
+    /// The pillar code the championships site's URLs use.
+    var siteSlug: String {
+        switch self {
+        case .tcg: "tcg"
+        case .vgc: "vgc"
+        case .go: "go"
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .tcg: "TCG"
+        case .vgc: "VGC"
+        case .go: "Pokémon GO"
+        }
+    }
+
+    /// Pokémon GO has a single combined leaderboard with no age divisions.
+    var hasDivisions: Bool { self != .go }
+
+    /// The API's division value for `division` on this game's board.
+    func divisionSlug(_ division: Division) -> String { hasDivisions ? division.rawValue : "all" }
+}
+
 nonisolated struct LeaderboardPlayer: Codable, Hashable, Sendable, Identifiable {
     let rank: Int
     let name: String
@@ -37,6 +78,8 @@ nonisolated struct LeaderboardIndex: Codable, Sendable {
     var season: String? = nil
     /// Code of the `LeaderboardRegion` this index was built for (nil in older caches = Global).
     var region: String? = nil
+    /// Raw value of the `Game` this index was built for (nil in older caches = TCG).
+    var game: String? = nil
 }
 
 /// Play! Pokémon championship regions. Each zone has its own leaderboard with region-specific ranks.

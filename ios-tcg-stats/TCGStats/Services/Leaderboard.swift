@@ -6,16 +6,16 @@ nonisolated struct LeaderboardError: LocalizedError, Sendable {
     var errorDescription: String? { message }
 }
 
-extension Division {
-    /// The division's leaderboard on Pokémon's championships site.
-    nonisolated var pageURL: URL {
-        URL(string: "https://championships.pokemon.com/en-us/competitors/leaderboards/?pillar=tcg&division=\(rawValue)")!
+extension Game {
+    /// The game's leaderboard on Pokémon's championships site.
+    nonisolated func pageURL(division: Division) -> URL {
+        URL(string: "https://championships.pokemon.com/en-us/competitors/leaderboards/?pillar=\(siteSlug)&division=\(divisionSlug(division))")!
     }
 }
 
-/// Downloads the Play! Pokémon TCG Championship Points leaderboard from the championships site's API
+/// Downloads the Play! Pokémon Championship Points leaderboard from the championships site's API
 /// (api.play.pokemon.com), which is open — no bot check. The site has no name search, so the whole
-/// division is indexed once (cached on disk for 12 hours) and searched locally.
+/// board is indexed once (cached on disk for 12 hours) and searched locally.
 nonisolated enum Leaderboard {
     /// The championships site's content store: source of the live region, division and season filters.
     private static let store = URL(string: "https://championships.pokemon.com/api/1/site/content_store/item.json?url=/site/website/en-us/competitors/leaderboards/index.xml&flatten=true")!
@@ -59,16 +59,18 @@ nonisolated enum Leaderboard {
         return dir
     }
 
-    private static func cacheURL(_ division: Division, _ region: LeaderboardRegion) -> URL {
+    private static func cacheURL(_ game: Game, _ division: Division, _ region: LeaderboardRegion) -> URL {
         let suffix = region == .global ? "" : "-\(region.rawValue.lowercased())"
-        return cacheDir.appendingPathComponent("\(division.rawValue)\(suffix)-v4.json")
+        return cacheDir.appendingPathComponent("\(game.apiSlug)-\(game.divisionSlug(division))\(suffix)-v4.json")
     }
 
-    static func cached(_ division: Division, _ region: LeaderboardRegion) async -> LeaderboardIndex? {
-        let url = cacheURL(division, region)
+    static func cached(_ game: Game, _ division: Division, _ region: LeaderboardRegion) async -> LeaderboardIndex? {
+        let url = cacheURL(game, division, region)
         return await Task.detached(priority: .userInitiated) {
             guard let data = try? Data(contentsOf: url),
                   let index = try? JSONDecoder().decode(LeaderboardIndex.self, from: data),
+                  index.division == game.divisionSlug(division),
+                  (index.game ?? Game.tcg.rawValue) == game.rawValue,
                   (index.region ?? LeaderboardRegion.global.rawValue) == region.rawValue else { return nil }
             return index
         }.value
@@ -78,9 +80,9 @@ nonisolated enum Leaderboard {
         index.complete && Date().timeIntervalSince(index.fetchedAt) < cacheTTL
     }
 
-    private static func save(_ index: LeaderboardIndex, _ division: Division, _ region: LeaderboardRegion) {
+    private static func save(_ index: LeaderboardIndex, _ game: Game, _ division: Division, _ region: LeaderboardRegion) {
         guard let data = try? JSONEncoder().encode(index) else { return }
-        try? data.write(to: cacheURL(division, region), options: .atomic)
+        try? data.write(to: cacheURL(game, division, region), options: .atomic)
     }
 
     // MARK: Season
@@ -141,13 +143,13 @@ nonisolated enum Leaderboard {
 
     // MARK: Fetching
 
-    private static func fetchPage(_ division: Division, _ region: LeaderboardRegion, period: String, page: Int) async throws -> Board {
+    private static func fetchPage(_ game: Game, _ division: Division, _ region: LeaderboardRegion, period: String, page: Int) async throws -> Board {
         var c = URLComponents(string: api)!
         c.queryItems = [
-            .init(name: "product", value: "tcg"),
+            .init(name: "product", value: game.apiSlug),
             .init(name: "region", value: region.rawValue),
             .init(name: "region_type", value: region.type),
-            .init(name: "division", value: division.rawValue),
+            .init(name: "division", value: game.divisionSlug(division)),
             .init(name: "period", value: period),
             .init(name: "page_size", value: String(perPage)),
             .init(name: "page", value: String(page)),
@@ -212,20 +214,22 @@ nonisolated enum Leaderboard {
         return nil
     }
 
-    /// Indexes `division`. `onProgress` receives the players collected so far (unsorted) and the expected total.
+    /// Indexes the game's board for `division`. `onProgress` receives the players collected so far (unsorted) and the expected total.
     static func load(
+        _ game: Game,
         _ division: Division,
         region: LeaderboardRegion,
         onProgress: @escaping @Sendable ([LeaderboardPlayer], Int) async -> Void
     ) async throws -> LeaderboardIndex {
         let period = await currentPeriod()
-        let first = try await fetchPage(division, region, period: period.guid, page: 1)
+        let first = try await fetchPage(game, division, region, period: period.guid, page: 1)
         guard !first.players.isEmpty else {
-            throw LeaderboardError(message: "The \(division.label) \(region == .global ? "" : "\(region.label) ")leaderboard came back empty.")
+            let scope = game == .go ? game.label : "\(division.label) \(region == .global ? "" : "\(region.label) ")"
+            throw LeaderboardError(message: "The \(scope)leaderboard came back empty.")
         }
         let total = first.total
         let pageCount = max(1, Int((Double(total) / Double(perPage)).rounded(.up)))
-        print("[Leaderboard] \(division.rawValue): total=\(total) pages=\(pageCount) season=\(period.label)")
+        print("[Leaderboard] \(game.rawValue)/\(game.divisionSlug(division)): total=\(total) pages=\(pageCount) season=\(period.label)")
 
         let collector = Collector()
         await onProgress(await collector.add(first.players), total)
@@ -234,7 +238,7 @@ nonisolated enum Leaderboard {
             try await withThrowingTaskGroup(of: [LeaderboardPlayer]?.self) { group in
                 var pages = Array(2...pageCount).makeIterator()
                 let task: @Sendable (Int) async throws -> [LeaderboardPlayer]? = { page in
-                    do { return try await fetchPage(division, region, period: period.guid, page: page).players }
+                    do { return try await fetchPage(game, division, region, period: period.guid, page: page).players }
                     catch is CancellationError { throw CancellationError() }
                     catch { return nil }
                 }
@@ -254,9 +258,9 @@ nonisolated enum Leaderboard {
 
         let players = await collector.all().sorted { $0.rank < $1.rank }
         let failed = await collector.failedPages
-        let index = LeaderboardIndex(division: division.rawValue, fetchedAt: Date(), total: total, complete: failed == 0, players: players, season: period.label, region: region.rawValue)
-        print("[Leaderboard] \(division.rawValue): indexed \(players.count)/\(total) (failed pages \(failed))")
-        save(index, division, region)
+        let index = LeaderboardIndex(division: game.divisionSlug(division), fetchedAt: Date(), total: total, complete: failed == 0, players: players, season: period.label, region: region.rawValue, game: game.rawValue)
+        print("[Leaderboard] \(game.rawValue)/\(game.divisionSlug(division)): indexed \(players.count)/\(total) (failed pages \(failed))")
+        save(index, game, division, region)
         return index
     }
 

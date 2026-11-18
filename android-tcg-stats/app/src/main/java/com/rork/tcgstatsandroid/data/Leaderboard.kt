@@ -32,11 +32,20 @@ class LeaderboardException(message: String) : Exception(message)
 enum class Division(val slug: String, val label: String) {
     Masters("masters", "Masters"),
     Seniors("seniors", "Seniors"),
-    Juniors("juniors", "Juniors");
+    Juniors("juniors", "Juniors"),
+}
 
-    /** The division's leaderboard on Pokémon's championships site. */
-    val pageUrl: String
-        get() = "https://championships.pokemon.com/en-us/competitors/leaderboards/?pillar=tcg&division=$slug"
+/** Championship product: the Trading Card Game, the video games (VGC) or Pokémon GO. */
+enum class Game(val slug: String, val siteSlug: String, val label: String) {
+    TCG("tcg", "tcg", "TCG"),
+    VGC("vg", "vgc", "VGC"),
+    GO("pgo", "go", "Pokémon GO");
+
+    /** Pokémon GO has a single combined leaderboard with no age divisions. */
+    val hasDivisions: Boolean get() = this != GO
+
+    /** The API's division value for [division] on this game's board. */
+    fun divisionSlug(division: Division): String = if (hasDivisions) division.slug else "all"
 }
 
 /** Play! Pokémon championship regions. Each zone has its own leaderboard with region-specific ranks. */
@@ -73,12 +82,14 @@ data class LeaderboardIndex(
     val season: String? = null,
     /** Code of [LeaderboardRegion] this index was built for. */
     val region: String = LeaderboardRegion.Global.code,
+    /** Slug of [Game] this index was built for. */
+    val game: String = Game.TCG.slug,
 )
 
 /**
- * Downloads the Play! Pokémon TCG Championship Points leaderboard from the championships site's API
+ * Downloads the Play! Pokémon Championship Points leaderboard from the championships site's API
  * (api.play.pokemon.com), which is open — no bot check. The site has no name search, so the whole
- * division is indexed once (cached on disk for [CACHE_TTL_MS]) and searched locally.
+ * board is indexed once (cached on disk for [CACHE_TTL_MS]) and searched locally.
  */
 object Leaderboard {
     /** The championships site's content store: source of the live region, division and season filters. */
@@ -99,31 +110,33 @@ object Leaderboard {
     /** A championship-points season/cycle as listed in the championships site's filters. */
     data class LeaderboardPeriod(val guid: String, val label: String)
 
-    fun pageUrl(division: Division): String = division.pageUrl
+    fun pageUrl(game: Game, division: Division): String =
+        "https://championships.pokemon.com/en-us/competitors/leaderboards/?pillar=${game.siteSlug}&division=${game.divisionSlug(division)}"
 
     // ---------- Cache ----------
 
-    private fun cacheFile(context: Context, division: Division, region: LeaderboardRegion): File {
+    private fun cacheFile(context: Context, game: Game, division: Division, region: LeaderboardRegion): File {
         val suffix = if (region == LeaderboardRegion.Global) "" else "-${region.code.lowercase(Locale.US)}"
-        return File(context.filesDir, "leaderboard").apply { mkdirs() }.let { File(it, "${division.slug}$suffix-v4.json") }
+        return File(context.filesDir, "leaderboard").apply { mkdirs() }
+            .let { File(it, "${game.slug}-${game.divisionSlug(division)}$suffix-v4.json") }
     }
 
     private fun periodsFile(context: Context): File =
         File(File(context.filesDir, "leaderboard").apply { mkdirs() }, "periods-v2.json")
 
-    suspend fun cached(context: Context, division: Division, region: LeaderboardRegion): LeaderboardIndex? = withContext(Dispatchers.IO) {
-        val file = cacheFile(context, division, region)
+    suspend fun cached(context: Context, game: Game, division: Division, region: LeaderboardRegion): LeaderboardIndex? = withContext(Dispatchers.IO) {
+        val file = cacheFile(context, game, division, region)
         if (!file.exists()) return@withContext null
         runCatching { LimitlessClient.json.decodeFromString(LeaderboardIndex.serializer(), file.readText()) }.getOrNull()
-            ?.takeIf { it.division == division.slug && it.region == region.code }
+            ?.takeIf { it.division == game.divisionSlug(division) && it.region == region.code && it.game == game.slug }
     }
 
     fun isFresh(index: LeaderboardIndex): Boolean =
         index.complete && System.currentTimeMillis() - index.fetchedAt < CACHE_TTL_MS
 
-    private suspend fun save(context: Context, division: Division, region: LeaderboardRegion, index: LeaderboardIndex) = withContext(Dispatchers.IO) {
+    private suspend fun save(context: Context, game: Game, division: Division, region: LeaderboardRegion, index: LeaderboardIndex) = withContext(Dispatchers.IO) {
         runCatching {
-            val file = cacheFile(context, division, region)
+            val file = cacheFile(context, game, division, region)
             val tmp = File(file.parentFile, file.name + ".tmp")
             tmp.writeText(LimitlessClient.json.encodeToString(LeaderboardIndex.serializer(), index))
             tmp.renameTo(file)
@@ -203,8 +216,8 @@ object Leaderboard {
 
     private class Board(val players: List<LeaderboardPlayer>, val total: Int)
 
-    private suspend fun fetchPage(division: Division, region: LeaderboardRegion, period: String, page: Int): Board {
-        val url = "$API?product=tcg&region=${region.code}&region_type=${region.type}&division=${division.slug}" +
+    private suspend fun fetchPage(game: Game, division: Division, region: LeaderboardRegion, period: String, page: Int): Board {
+        val url = "$API?product=${game.slug}&region=${region.code}&region_type=${region.type}&division=${game.divisionSlug(division)}" +
             "&period=$period&page_size=$PER_PAGE&page=$page&point_type=championship&sort_by=ranking_order:asc"
         var attempt = 0
         while (true) {
@@ -252,18 +265,21 @@ object Leaderboard {
      */
     suspend fun load(
         activity: Activity,
+        game: Game,
         division: Division,
         region: LeaderboardRegion,
         onProgress: suspend (List<LeaderboardPlayer>, Int) -> Unit,
     ): LeaderboardIndex {
         val period = currentPeriod(activity.applicationContext)
-        val first = fetchPage(division, region, period.guid, 1)
+        val first = fetchPage(game, division, region, period.guid, 1)
         if (first.players.isEmpty()) {
-            throw LeaderboardException("The ${division.label} ${if (region == LeaderboardRegion.Global) "" else "${region.label} "}leaderboard came back empty.")
+            val scope = if (game == Game.GO) game.label
+                else "${division.label} ${if (region == LeaderboardRegion.Global) "" else "${region.label} "}"
+            throw LeaderboardException("The $scope leaderboard came back empty.")
         }
         val total = first.total
         val pageCount = ceil(total / PER_PAGE.toDouble()).toInt().coerceAtLeast(1)
-        Log_d("${division.slug}: total=$total pages=$pageCount season=${period.label}")
+        Log_d("${game.slug}/${game.divisionSlug(division)}: total=$total pages=$pageCount season=${period.label}")
 
         val collected = ConcurrentHashMap<String, LeaderboardPlayer>()
         first.players.forEach { collected[it.key] = it }
@@ -277,7 +293,7 @@ object Leaderboard {
                 (2..pageCount).map { page ->
                     async {
                         semaphore.withPermit {
-                            val result = runCatching { fetchPage(division, region, period.guid, page) }
+                            val result = runCatching { fetchPage(game, division, region, period.guid, page) }
                             result.exceptionOrNull()?.let { if (it is CancellationException) throw it }
                             val players = result.getOrNull()?.players
                             if (players == null) failed.incrementAndGet() else players.forEach { collected[it.key] = it }
@@ -289,16 +305,17 @@ object Leaderboard {
         }
         val players = withContext(Dispatchers.Default) { collected.values.sortedBy { it.rank } }
         val index = LeaderboardIndex(
-            division = division.slug,
+            division = game.divisionSlug(division),
             fetchedAt = System.currentTimeMillis(),
             total = total,
             complete = failed.get() == 0,
             players = players,
             season = period.label,
             region = region.code,
+            game = game.slug,
         )
-        Log_d("${division.slug}: indexed ${players.size}/$total (failed pages ${failed.get()})")
-        save(activity.applicationContext, division, region, index)
+        Log_d("${game.slug}/${game.divisionSlug(division)}: indexed ${players.size}/$total (failed pages ${failed.get()})")
+        save(activity.applicationContext, game, division, region, index)
         return index
     }
 

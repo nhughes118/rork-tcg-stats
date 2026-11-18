@@ -374,7 +374,7 @@ fun PlayersScreen(modifier: Modifier = Modifier, vm: PlayersViewModel = viewMode
     val haptic = LocalHapticFeedback.current
     var selectedKey by rememberSaveable { mutableStateOf<String?>(null) }
 
-    LaunchedEffect(state.division, state.region, activity) {
+    LaunchedEffect(state.game, state.division, state.region, activity) {
         activity?.let(vm::ensureLoaded)
     }
 
